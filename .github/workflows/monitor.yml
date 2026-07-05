@@ -1,0 +1,55 @@
+name: bsc-monitor
+
+# Runs the BSC fresh-deploy forward monitor on a schedule. State (last block + watchlist)
+# persists between runs via actions/cache. Alerts are pushed to your phone via Telegram.
+on:
+  schedule:
+    # Every 30 min — safe under the free 2000-min/mo quota on a PRIVATE repo.
+    # On a PUBLIC repo (unlimited free minutes) you can lower this to '*/5 * * * *'.
+    - cron: '*/30 * * * *'
+  workflow_dispatch: {}   # lets you run it manually from the Actions tab (use this to test now)
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bsc-monitor
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Restore monitor state
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: bscmon-state-${{ github.run_id }}
+          restore-keys: bscmon-state-
+
+      - name: Run one scan pass
+        env:
+          BSC_MON_HOME: ${{ github.workspace }}/state
+          ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # On a MANUAL "Run workflow" this is "true" -> sends a self-test ping proving the runner is
+          # alive + can reach Telegram. On the schedule it's "false" -> silent unless a real hit.
+          SELFTEST: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          mkdir -p state
+          python bscmon/bsc_forward_monitor.py --stdout
+
+      - name: Save monitor state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: bscmon-state-${{ github.run_id }}
