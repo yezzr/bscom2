@@ -1,0 +1,44 @@
+name: contest-radar
+
+# Watches Sherlock / Cantina / Code4rena for LIVE audit contests. Pings Telegram with a 🟢 STRIKE
+# alert the moment one goes live (and 🟡 on new announcements) so you can audit + fork-confirm day-1.
+on:
+  schedule:
+    - cron: '0 */3 * * *'   # every 3h — contests don't go live by the second; 3h catches the window early
+  workflow_dispatch: {}      # run manually anytime
+
+permissions:
+  contents: read
+
+concurrency:
+  group: contest-radar
+  cancel-in-progress: false
+
+jobs:
+  radar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Restore contest state
+        uses: actions/cache/restore@v4
+        with:
+          path: conteststate
+          key: contest-state-${{ github.run_id }}
+          restore-keys: contest-state-
+      - name: Run contest radar
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          mkdir -p conteststate
+          python bscmon/contest_radar.py --state conteststate/contest_state.json
+      - name: Save contest state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: conteststate
+          key: contest-state-${{ github.run_id }}
