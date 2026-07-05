@@ -61,8 +61,9 @@ seen = set()
 def _rpc(method, params):
     body = json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params}).encode()
     try:
+        # publicnode (and most public RPCs) return 403 WITHOUT a User-Agent — required, not optional.
         return json.loads(urllib.request.urlopen(urllib.request.Request(
-            HTTP, body, {'Content-Type':'application/json'}), timeout=20).read()).get('result')
+            HTTP, body, {'Content-Type':'application/json', 'User-Agent':'Mozilla/5.0'}), timeout=20).read()).get('result')
     except Exception:
         return None
 
@@ -93,28 +94,27 @@ def fork_confirm(token, pair, liq):
     except Exception as e:
         print('  fork_confirm err', str(e)[:80]); return False
 
-def handle_pair(token0, token1, pair):
-    """Evaluate a freshly-created pair the instant it appears. (Host-agnostic entry point:
-    an Alchemy-webhook -> Cloudflare Worker variant would call this with the decoded log.)"""
-    if pair.lower() in seen: return
-    seen.add(pair.lower())
-    liq, base, token = base_liquidity_usd(pair, token0, token1)
-    if not token or liq < MIN_LIQ_USD:
-        return                                        # no base pairing or not yet funded to the floor
+# A pair is CREATED with $0 liquidity; the LP is added seconds-to-minutes later in a separate tx. So we
+# don't judge at creation — we WATCH the pair and re-poll its liquidity until it crosses the floor (then
+# run the arsenal) or times out (never funded). This fires at the liquidity-DEPOSIT moment, not creation.
+pending = {}                 # pair(lower) -> (token0, token1, first_ts)
+plock = threading.Lock()
+POLL_EVERY = 20              # re-check pending pairs' liquidity this often (s)
+PENDING_TTL = 900           # keep watching a new pair up to 15 min for liquidity to land
+MAX_PENDING = 600           # cap the watchlist (free-endpoint rate safety)
+
+def _process_funded(token0, token1, pair, liq, base, token):
+    """Pair has crossed the liquidity floor -> pull source, run the arsenal, alert on a real class."""
     cn, src = getsrc(token)
     if not src:
         return                                        # unverified -> skip (v1; bytecode mode is a later add)
     verdict = [x[0] + (':' + x[1] if x[1] else '') for x in run_arsenal(src)]
-    gated, gsig = detect_buy_gate(src)
     if not verdict:
         return
     classes = {v.split(':')[0] for v in verdict}
-    # precise classes: ping instantly. FP-heavy FORCE-DUMP: fork-sim confirm first.
-    precise = is_pushworthy(verdict)
-    force_dump = 'FORCE-DUMP' in classes
-    ping = precise
-    tag = 'PRECISE'
-    if not precise and force_dump and CONFIRM:
+    precise = is_pushworthy(verdict)                  # precise classes: ping instantly
+    ping, tag = precise, 'PRECISE'
+    if not precise and 'FORCE-DUMP' in classes and CONFIRM:   # FP-heavy: fork-sim CONFIRM before ping
         if fork_confirm(token, pair, liq):
             ping, tag = True, 'FORK-CONFIRMED-EXPLOITABLE'
     if ping:
@@ -124,12 +124,54 @@ def handle_pair(token0, token1, pair):
     else:
         print('  seen risky-but-unconfirmed', token, verdict, flush=True)
 
+def _check_once(token0, token1, pair):
+    """Cheap liquidity poll. Returns True = STOP watching (funded+processed, or no base pairing),
+    False = keep watching (base-paired but not yet funded to the floor)."""
+    liq, base, token = base_liquidity_usd(pair, token0, token1)
+    if not token:
+        return True                                   # no base asset we can value -> never a target
+    if liq < MIN_LIQ_USD:
+        return False                                  # base-paired but LP not deposited yet -> keep watching
+    if pair.lower() in seen:
+        return True
+    seen.add(pair.lower())
+    _process_funded(token0, token1, pair, liq, base, token)
+    return True
+
+def handle_pair(token0, token1, pair):
+    """New pair created. Try once (some bots add LP in the same tx); else queue for liquidity re-poll."""
+    if pair.lower() in seen: return
+    try:
+        done = _check_once(token0, token1, pair)
+    except Exception as e:
+        print('  check err', str(e)[:80]); done = False
+    if not done:
+        with plock:
+            if len(pending) < MAX_PENDING and pair.lower() not in pending:
+                pending[pair.lower()] = (token0, token1, time.time())
+
+def _repoll_loop():
+    """Every POLL_EVERY s, re-check watched pairs' liquidity; process the instant one funds; drop on TTL."""
+    while True:
+        time.sleep(POLL_EVERY)
+        now = time.time()
+        with plock:
+            items = list(pending.items())
+        for p, (t0, t1, ts) in items:
+            drop = (p in seen) or (now - ts > PENDING_TTL)
+            if not drop:
+                try: drop = _check_once(t0, t1, p)    # True once funded+processed (or no base)
+                except Exception: drop = False
+            if drop:
+                with plock: pending.pop(p, None)
+
 def _dispatch(token0, token1, pair):
     threading.Thread(target=handle_pair, args=(token0, token1, pair), daemon=True).start()
 
 async def run():
     if websockets is None:
         print('!! pip install websockets'); return
+    threading.Thread(target=_repoll_loop, daemon=True).start()   # liquidity-deposit watcher
     sub = {'jsonrpc':'2.0','id':1,'method':'eth_subscribe',
            'params':['logs', {'address': [FACTORY_V2, FACTORY_V3],
                               'topics': [[PAIRCREATED, POOLCREATED]]}]}
