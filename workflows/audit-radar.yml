@@ -1,0 +1,46 @@
+name: audit-radar
+
+# Cook-lane targeting: once a day, surface OLD + FUNDED + THIN-AUDIT protocols (with 💰 bounty tags)
+# from DeFiLlama + Immunefi and push a ranked digest to Telegram. You then deep-audit the top pick.
+on:
+  schedule:
+    - cron: '0 13 * * *'   # once daily ~13:00 UTC
+  workflow_dispatch: {}     # run manually anytime
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-radar
+  cancel-in-progress: false
+
+jobs:
+  radar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Restore radar state
+        uses: actions/cache/restore@v4
+        with:
+          path: radarstate
+          key: radar-state-${{ github.run_id }}
+          restore-keys: radar-state-
+      - name: Run radar
+        env:
+          RADAR_HOME: ${{ github.workspace }}/radarstate
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # MIN_TVL / MAX_TVL / MAX_AUDITS / AGE_DAYS / STALE_MAX / TOP_N can be set here to tune.
+        run: |
+          mkdir -p radarstate
+          python bscmon/old_funded_radar.py --stdout
+      - name: Save radar state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: radarstate
+          key: radar-state-${{ github.run_id }}
