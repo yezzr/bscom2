@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+bscmon.env
+*state*.json
+*seen*.json
+*alerts*.json
