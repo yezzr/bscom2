@@ -37,12 +37,17 @@ except Exception:
         return False
     def detect_buy_gate(s): return (False, '')
 
-# KEYLESS public BSC endpoints by default (no Alchemy key needed -> nothing to leak on a public repo).
-# Override with BSC_WSS_URL / BSC_RPC_URL secrets if you later want a dedicated (higher-rate) provider.
-WSS = os.environ.get('BSC_WSS_URL') or 'wss://bsc-rpc.publicnode.com'
-HTTP = os.environ.get('BSC_RPC_URL') or 'https://bsc-rpc.publicnode.com'
+# Endpoints: prefer Alchemy (reliable log streaming) when ALCHEMY_KEY is set as a SECRET (safe on a public
+# repo — it's not in code); fall back to keyless publicnode. publicnode's free pool is flaky for log subs.
+_AK = os.environ.get('ALCHEMY_KEY')
+WSS = os.environ.get('BSC_WSS_URL') or (
+    'wss://bnb-mainnet.g.alchemy.com/v2/%s' % _AK if _AK else 'wss://bsc-rpc.publicnode.com')
+HTTP = os.environ.get('BSC_RPC_URL') or (
+    'https://bnb-mainnet.g.alchemy.com/v2/%s' % _AK if _AK else 'https://bsc-rpc.publicnode.com')
 MIN_LIQ_USD = float(os.environ.get('MIN_LIQ_USD') or 1000)
 CONFIRM = os.environ.get('CONFIRM', '1') == '1'    # fork-sim confirm the FP-heavy FORCE-DUMP class before ping
+HEARTBEAT_SECS = int(os.environ.get('HEARTBEAT_SECS') or 7200)   # visibility ping every 2h (proves alive+working)
+STATS = {'pairs': 0, 'funded': 0, 'alerts': 0, 'start': time.time()}   # for the heartbeat
 
 # both PancakeSwap factories — fresh liquidity lands on V2 AND V3 now
 FACTORY_V2 = '0xca143ce32fe78f1f7019d7d551a6402fc5350c73'
@@ -108,6 +113,7 @@ def _process_funded(token0, token1, pair, liq, base, token):
     cn, src = getsrc(token)
     if not src:
         return                                        # unverified -> skip (v1; bytecode mode is a later add)
+    STATS['funded'] += 1                              # a funded pair we actually fetched + scanned
     verdict = [x[0] + (':' + x[1] if x[1] else '') for x in run_arsenal(src)]
     if not verdict:
         return
@@ -118,6 +124,7 @@ def _process_funded(token0, token1, pair, liq, base, token):
         if fork_confirm(token, pair, liq):
             ping, tag = True, 'FORK-CONFIRMED-EXPLOITABLE'
     if ping:
+        STATS['alerts'] += 1
         notify('LIVE FRESH-DEPLOY [%s]  ~$%.0f %s liq\n%s (%s)\nverdict: %s\nbscscan.com/token/%s'
                % (tag, liq, base or '?', token, cn, ', '.join(verdict), token))
         print('  >>> ALERTED', token, tag, verdict, flush=True)
@@ -150,11 +157,19 @@ def handle_pair(token0, token1, pair):
             if len(pending) < MAX_PENDING and pair.lower() not in pending:
                 pending[pair.lower()] = (token0, token1, time.time())
 
+_last_hb = [time.time()]
 def _repoll_loop():
-    """Every POLL_EVERY s, re-check watched pairs' liquidity; process the instant one funds; drop on TTL."""
+    """Every POLL_EVERY s, re-check watched pairs' liquidity; process the instant one funds; drop on TTL.
+    Also emits a periodic HEARTBEAT so silence is distinguishable from death (BSC new-pair rate is genuinely
+    low, ~0.1/min, so long gaps with zero alerts are NORMAL — the heartbeat proves it's alive + processing)."""
     while True:
         time.sleep(POLL_EVERY)
         now = time.time()
+        if now - _last_hb[0] >= HEARTBEAT_SECS:
+            up = (now - STATS['start']) / 3600.0
+            notify('listener heartbeat: %.1fh up | %d new pairs seen, %d funded+scanned, %d ALERTS | %d on liq-watchlist'
+                   % (up, STATS['pairs'], STATS['funded'], STATS['alerts'], len(pending)))
+            _last_hb[0] = now
         with plock:
             items = list(pending.items())
         for p, (t0, t1, ts) in items:
@@ -195,6 +210,7 @@ async def run():
                         pool = '0x' + data[26:66]; kind = 'V2'
                     else:                                      # V3: data = tickSpacing(w0) + pool(w1)
                         pool = '0x' + data[90:130]; kind = 'V3'
+                    STATS['pairs'] += 1
                     print(time.strftime('%H:%M:%S'), kind, 'new', t0, t1, '->', pool, flush=True)
                     _dispatch(t0, t1, pool)
         except Exception as e:
