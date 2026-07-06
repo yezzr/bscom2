@@ -31,7 +31,9 @@ jobs:
         run: pip install websockets
       - name: Run listener (bounded to ~5h50m, then exits cleanly for the next cron)
         env:
-          # No Alchemy key needed — listener uses keyless public BSC endpoints (wss://bsc-rpc.publicnode.com)
+          # ALCHEMY_KEY (SECRET, not in code) = reliable BSC log streaming; without it, falls back to flaky
+          # keyless publicnode. Use your EXISTING Alchemy key value — as a Secret it's safe on a public repo.
+          ALCHEMY_KEY: ${{ secrets.ALCHEMY_KEY }}
           ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}   # for contract-source fetches in the arsenal
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
