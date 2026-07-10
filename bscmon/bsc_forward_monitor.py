@@ -25,8 +25,23 @@ STATE = os.path.join(HOME, 'bsc_forward_state.json')
 ALERTS = os.path.join(HOME, 'bsc_forward_alerts.json')
 MIN_LIQ_USD = float(os.environ.get('MIN_LIQ_USD') or 1000)   # alert once a risky token has >=$1k drainable liquidity (user-specified floor)
 GT_PAGES = int(os.environ.get('GT_PAGES') or 6)              # GeckoTerminal pages per endpoint
+BSC_RPC = os.environ.get('BSC_RPC') or 'https://bsc-rpc.publicnode.com'   # eth_getCode for the bytecode tell (no key needed)
 WATCH_CAP = 6000                                             # cap the seen-set so state stays small
 RISKY = {'PAIR-BURN-SYNC', 'PARKED-MINT', 'DOUBLE-SETTLE', 'BROKEN-PERMIT', 'FORCE-DUMP', 'DRAIN', 'BASKET-DEPEG'}
+# Fork-sim CONFIRMED clean/not-exploitable (round-trip PnL negative or untradable) — hard-suppressed
+# forever so they stop reappearing in the daily digest. Tokens are immutable: clean is permanent.
+CLEARED_SEED = {
+    '0xe92f7fe3eaf61df28b7b75f3faab199333c42302',  # MAMEINU
+    '0xeb2b7d5691878627eff20492ca7c9a71228d931d',  # CREPE (reflection fee-swap FP)
+    '0x51363f073b1e4920fda7aa9e9d84ba97ede1560e',  # Contract $1.16M
+    '0xb71b52428f66e7f3b724321c7c57f545fb87122c',  # DOGSHIT
+    '0xebbb9ae714a21411de0e2db13c56deeee5a9b999',  # MemeToken4
+    '0x31b53de90a36e5f2372797478e4e1e2ed4ca4444',  # FatTokenV5
+    '0xf9ef7eedddb3546a627b286e240a574d01947410',  # FatTokenV5 (variant)
+    '0xfa989cf01ec5d35b1137c41a11566a422cc57777',  # tcc
+    '0x8bec537e4eabc77422a38ac3d0bcc488d4797777',  # TRUMP
+    '0x35a581894377eaddd568aab6148a7df462044444',  # PRISONP
+}
 
 def is_pushworthy(verdict):
     """Only PUSH the precise/validated classes — the noisy ones (FORCE-DUMP, DRAIN, BUY-GATED-alone,
@@ -79,6 +94,34 @@ def jget(url):
         except Exception:
             time.sleep(0.8)
     return {}
+
+def getcode(token):
+    """Runtime bytecode via eth_getCode (public node, no key). '' on failure — never crash a pass."""
+    try:
+        payload = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'eth_getCode',
+                              'params': [token, 'latest']}).encode()
+        req = urllib.request.Request(BSC_RPC, payload, {'Content-Type': 'application/json',
+                                                        'User-Agent': 'Mozilla/5.0'})
+        return (json.loads(urllib.request.urlopen(req, timeout=15).read()).get('result') or '').lower()
+    except Exception:
+        return ''
+
+# Burn selectors seen in the pair-burn-sync drain family (JL/BYToken/AIDC/STO). We do NOT rely on
+# function NAMES (JL's burn entry is a hidden 0xb1faeac6) — any of these present alongside sync() is the tell.
+_BURN_SELS = ('42966c68', '9dc29fac', '89afcb44', 'b1faeac6', '6b2fb3a3')  # burn(uint256)/burn(addr,uint)/pair burn/hidden/misc
+
+def bytecode_burn_sync(token):
+    """The JL/BYToken class tell, on BYTECODE (works on UNVERIFIED tokens, immune to hidden burn selectors):
+    a TOKEN whose runtime code references the pair's sync() (0xfff6cae9) has no legitimate reason to —
+    that is the reserve-corruption primitive (burn pool balance -> sync() writes the skewed reserve).
+    Returns a verdict tag. sync()+a burn selector = HIGH (push); sync() alone = review-tier lead."""
+    code = getcode(token)
+    if not code or 'fff6cae9' not in code:      # no sync() reference -> not this class
+        return None
+    has_burn = any(s in code for s in _BURN_SELS)
+    # sync() in a token is the tell by itself — BOTH variants HIGH (pushable). Gating the push on a known
+    # burn selector would re-break hidden-selector immunity (JL's 0xb1faeac6 would only 'review', never alert).
+    return 'PAIR-BURN-SYNC:BYTE-SYNC+BURN(HIGH)' if has_burn else 'PAIR-BURN-SYNC:BYTE-SYNC(HIGH)'
 
 def gt_pools():
     """token(lower) -> (pool, liq_usd, name). Fresh + trending BSC pools from GeckoTerminal."""
@@ -146,6 +189,11 @@ def one_pass():
     seen = st.get('seen', {})          # token -> {verdict, name, pool, alerted}
     review_today = st.get('review_today', [])   # risky-but-unconfirmed tokens seen since the last heartbeat
     hb_date = st.get('hb_date', '')             # last calendar day a heartbeat digest was sent
+    # PERSISTENT DEDUP: a token surfaced in a prior heartbeat digest (reviewed) or fork-confirmed
+    # clean (cleared) must NEVER be re-listed — tokens are immutable, so a clean verdict is permanent.
+    # This kills the "same tokens reported every single day" noise.
+    reviewed = set(x.lower() for x in st.get('reviewed', []))    # already shown in a past digest
+    cleared = set(x.lower() for x in st.get('cleared', [])) | CLEARED_SEED   # fork-confirmed clean / not-exploitable, hard-suppress
     alerts = load(ALERTS, [])
     pools = gt_pools()
     for token, (pool, liq, name) in ds_pools().items():        # union DexScreener (max liquidity per token)
@@ -163,9 +211,16 @@ def one_pass():
                 g, why = detect_buy_gate(src)
                 if g:
                     verdict.append('BUY-GATED:' + why[:50])
+            # BYTECODE tell — runs on EVERY token incl. UNVERIFIED (the JL gap: JL had no source so the
+            # source arsenal above saw nothing). Catches the pair-burn-sync drain class by capability.
+            bts = bytecode_burn_sync(token)
+            if bts:
+                verdict.append(bts)
             info = {'verdict': verdict, 'name': cn or name, 'pool': pool, 'alerted': False}
             seen[token] = info
             analyzed += 1
+        if token.lower() in cleared:
+            continue                                            # fork-confirmed clean — never alert or review again
         if is_pushworthy(info.get('verdict', [])) and not info.get('alerted') and liq >= MIN_LIQ_USD:
             info['alerted'] = True
             fired += 1
@@ -177,6 +232,7 @@ def one_pass():
             notify('BSC fresh-deploy ALERT\n%s — %s\nliq ~$%d\n%s\ntoken: %s\nhttps://bscscan.com/token/%s'
                    % (info.get('name') or '?', rec['note'], liq, ' '.join(info['verdict']), token, token))
         elif (liq >= MIN_LIQ_USD and not info.get('alerted') and len(review_today) < 300
+              and token.lower() not in reviewed         # NEW: never re-surface a token shown in a prior digest
               and any(v.split(':')[0] in RISKY or v.startswith('BUY-GATED') for v in info.get('verdict', []))
               and token not in {r['token'] for r in review_today}):
             # REVIEW tier: funded + a risky/gated detector fired but NOT the high-confidence class.
@@ -199,11 +255,17 @@ def one_pass():
         for r in top:
             lines.append('· %s $%d [%s] bscscan.com/token/%s' % (r['name'] or '?', r['liq'], r['verdict'], r['token']))
         if not top:
-            lines.append('(none tripped even the review tier — quiet day)')
+            lines.append('(none new tripped even the review tier — quiet day)')
         notify('\n'.join(lines))
+        # mark everything surfaced this digest as reviewed so it NEVER repeats in a future heartbeat
+        for r in review_today:
+            reviewed.add(r['token'].lower())
+        if len(reviewed) > 20000:                       # bound the ledger (addresses only)
+            reviewed = set(list(reviewed)[-20000:])
         review_today = []
         hb_date = today
-    json.dump({'seen': seen, 'review_today': review_today, 'hb_date': hb_date}, open(STATE, 'w'))
+    json.dump({'seen': seen, 'review_today': review_today, 'hb_date': hb_date,
+               'reviewed': sorted(reviewed), 'cleared': sorted(cleared)}, open(STATE, 'w'))
     json.dump(alerts, open(ALERTS, 'w'), indent=1)
     print('%s | pools(GT+DS) %d | newly analyzed %d | seen %d | review %d | alerts this pass %d (total %d)'
           % (time.strftime('%H:%M:%S'), len(pools), analyzed, len(seen), len(review_today), fired, len(alerts)), flush=True)
