@@ -107,21 +107,60 @@ def getcode(token):
         return ''
 
 # Burn selectors seen in the pair-burn-sync drain family (JL/BYToken/AIDC/STO). We do NOT rely on
-# function NAMES (JL's burn entry is a hidden 0xb1faeac6) — any of these present alongside sync() is the tell.
+# function NAMES (JL's burn entry is a hidden 0xb1faeac6) — any of these present alongside sync/skim is the tell.
 _BURN_SELS = ('42966c68', '9dc29fac', '89afcb44', 'b1faeac6', '6b2fb3a3')  # burn(uint256)/burn(addr,uint)/pair burn/hidden/misc
+_MANIP_SELS = ('fff6cae9', 'bc25cf77')     # sync() + skim() — either commits/extracts a corrupted pair reserve
+_EIP1967_IMPL = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc'
+_EIP1967_BEACON = '0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50'
+def _rpc(method, params):
+    try:
+        payload = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params}).encode()
+        req = urllib.request.Request(BSC_RPC, payload, {'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'})
+        return json.loads(urllib.request.urlopen(req, timeout=15).read()).get('result')
+    except Exception:
+        return None
+def _impl_code(token):
+    """EIP-1967 proxy -> implementation code so a sync/burn in the impl isn't missed (getCode(proxy)=stub).
+    Handles direct-impl-slot AND beacon proxies (factory-cloned token families). Custom proxies evade."""
+    r = _rpc('eth_getStorageAt', [token, _EIP1967_IMPL, 'latest'])
+    if r and int(r, 16) != 0:
+        return getcode('0x' + r[-40:])
+    b = _rpc('eth_getStorageAt', [token, _EIP1967_BEACON, 'latest'])          # beacon proxy
+    if b and int(b, 16) != 0:
+        impl = _rpc('eth_call', [{'to': '0x' + b[-40:], 'data': '0x5c60da1b'}, 'latest'])   # beacon.implementation()
+        if impl and int(impl, 16) != 0:
+            return getcode('0x' + impl[-40:])
+    return ''
+def _clone_impl(code):
+    """EIP-1167 minimal-proxy (clone): impl embedded in the ~45-byte stub. Scam factories mass-clone ONE
+    drain impl; the stub has no sync/burn, so parse the embedded impl and scan it. Deterministic, no RPC."""
+    m = '363d3d373d3d3d363d73'
+    i = code.find(m)
+    if i != -1 and len(code) >= i + len(m) + 40:
+        impl = '0x' + code[i + len(m):i + len(m) + 40]
+        try:
+            if int(impl, 16) != 0:
+                return impl
+        except Exception:
+            pass
+    return None
 
 def bytecode_burn_sync(token):
     """The JL/BYToken class tell, on BYTECODE (works on UNVERIFIED tokens, immune to hidden burn selectors):
     a TOKEN whose runtime code references the pair's sync() (0xfff6cae9) has no legitimate reason to —
     that is the reserve-corruption primitive (burn pool balance -> sync() writes the skewed reserve).
     Returns a verdict tag. sync()+a burn selector = HIGH (push); sync() alone = review-tier lead."""
-    code = getcode(token)
-    if not code or 'fff6cae9' not in code:      # no sync() reference -> not this class
+    own = getcode(token) or ''
+    code = own + _impl_code(token)                       # + EIP-1967 direct/beacon impl
+    ci = _clone_impl(own)                                # + EIP-1167 minimal-proxy clone impl
+    if ci:
+        code += (getcode(ci) or '')
+    if not any(s in code for s in _MANIP_SELS):         # no sync()/skim() reference -> not this class
         return None
     has_burn = any(s in code for s in _BURN_SELS)
-    # sync() in a token is the tell by itself — BOTH variants HIGH (pushable). Gating the push on a known
-    # burn selector would re-break hidden-selector immunity (JL's 0xb1faeac6 would only 'review', never alert).
-    return 'PAIR-BURN-SYNC:BYTE-SYNC+BURN(HIGH)' if has_burn else 'PAIR-BURN-SYNC:BYTE-SYNC(HIGH)'
+    # sync()/skim() in a token is the tell by itself — BOTH variants HIGH (pushable). Gating the push on a
+    # known burn selector would re-break hidden-selector immunity (JL's 0xb1faeac6 would only 'review').
+    return 'PAIR-BURN-SYNC:BYTE-SYNC/SKIM+BURN(HIGH)' if has_burn else 'PAIR-BURN-SYNC:BYTE-SYNC/SKIM(HIGH)'
 
 def gt_pools():
     """token(lower) -> (pool, liq_usd, name). Fresh + trending BSC pools from GeckoTerminal."""
