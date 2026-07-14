@@ -145,11 +145,16 @@ def _clone_impl(code):
             pass
     return None
 
-def bytecode_burn_sync(token):
-    """The JL/BYToken class tell, on BYTECODE (works on UNVERIFIED tokens, immune to hidden burn selectors):
-    a TOKEN whose runtime code references the pair's sync() (0xfff6cae9) has no legitimate reason to —
-    that is the reserve-corruption primitive (burn pool balance -> sync() writes the skewed reserve).
-    Returns a verdict tag. sync()+a burn selector = HIGH (push); sync() alone = review-tier lead."""
+def _burn_from_pair(src):
+    low = src.lower().replace(' ', '')
+    return any(k in low for k in ('_burn(pair', '_burn(uniswap', '_burn(pancake', '_burn(targetpool', '_burn(_pair',
+                                  '_burn(lppair', '_burn(pool', 'balances[pair]-=', '_balances[pair]-=', 'balanceof[pair]'))
+
+def bytecode_burn_sync(token, src=None):
+    """Pair-burn-sync tell on BYTECODE (unverified-safe). sync/skim + a burn selector -> HIGH. sync/skim WITHOUT a
+    known burn selector could be a hidden-burn drain (PHX) OR a LEGIT sync-caller (e.g. a rebase/LP token). When
+    VERIFIED source is available, require the burn-from-pair pattern for HIGH; verified-but-absent -> legit, drop
+    (kills the $91.8M-token class of FP). Unverified -> keep HIGH (can't disambiguate; the JL/PHX hidden-burn case)."""
     own = getcode(token) or ''
     code = own + _impl_code(token)                       # + EIP-1967 direct/beacon impl
     ci = _clone_impl(own)                                # + EIP-1167 minimal-proxy clone impl
@@ -157,10 +162,11 @@ def bytecode_burn_sync(token):
         code += (getcode(ci) or '')
     if not any(s in code for s in _MANIP_SELS):         # no sync()/skim() reference -> not this class
         return None
-    has_burn = any(s in code for s in _BURN_SELS)
-    # sync()/skim() in a token is the tell by itself — BOTH variants HIGH (pushable). Gating the push on a
-    # known burn selector would re-break hidden-selector immunity (JL's 0xb1faeac6 would only 'review').
-    return 'PAIR-BURN-SYNC:BYTE-SYNC/SKIM+BURN(HIGH)' if has_burn else 'PAIR-BURN-SYNC:BYTE-SYNC/SKIM(HIGH)'
+    if any(s in code for s in _BURN_SELS):
+        return 'PAIR-BURN-SYNC:SYNC/SKIM+BURN(HIGH)'
+    if src:                                              # verified source available -> trust it to disambiguate
+        return 'PAIR-BURN-SYNC:SRC-BURN-FROM-PAIR(HIGH)' if _burn_from_pair(src) else None
+    return 'PAIR-BURN-SYNC:UNVERIFIED-SYNC/SKIM(HIGH)'   # unverified -> keep HIGH (hidden-burn class)
 
 def gt_pools():
     """token(lower) -> (pool, liq_usd, name). Fresh + trending BSC pools from GeckoTerminal."""
@@ -252,7 +258,7 @@ def one_pass():
                     verdict.append('BUY-GATED:' + why[:50])
             # BYTECODE tell — runs on EVERY token incl. UNVERIFIED (the JL gap: JL had no source so the
             # source arsenal above saw nothing). Catches the pair-burn-sync drain class by capability.
-            bts = bytecode_burn_sync(token)
+            bts = bytecode_burn_sync(token, src)   # pass the already-fetched source -> verified-source FP filter
             if bts:
                 verdict.append(bts)
             info = {'verdict': verdict, 'name': cn or name, 'pool': pool, 'alerted': False}

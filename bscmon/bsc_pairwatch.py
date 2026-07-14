@@ -115,6 +115,26 @@ def _clone_impl(code):
             pass
     return None
 
+def _get_source(token):
+    """Etherscan verified source: non-empty str = verified w/ source, '' = unverified, None = couldn't check."""
+    key = os.environ.get("ETHERSCAN_API_KEY")
+    if not key:
+        return None
+    try:
+        u = "https://api.etherscan.io/v2/api?chainid=56&module=contract&action=getsourcecode&address=%s&apikey=%s" % (token, key)
+        r = json.loads(urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"}), timeout=15).read())
+        res = r.get("result")
+        if isinstance(res, list) and res:
+            return res[0].get("SourceCode") or ""
+    except Exception:
+        pass
+    return None
+
+def _burn_from_pair(src):
+    low = src.lower().replace(" ", "")
+    return any(k in low for k in ("_burn(pair", "_burn(uniswap", "_burn(pancake", "_burn(targetpool", "_burn(_pair",
+                                  "_burn(lppair", "_burn(pool", "balances[pair]-=", "_balances[pair]-=", "balanceof[pair]"))
+
 def sync_burn_flag(token):
     own = getcode(token)
     if own == "":                        # RPC failure — a real deployed token ALWAYS has code. Don't false-clear:
@@ -125,8 +145,14 @@ def sync_burn_flag(token):
         code += getcode(ci)
     if not any(s in code for s in _MANIP):
         return None
-    burn = any(s in code for s in _BURN)
-    return "PAIR-BURN-SYNC:BYTE-SYNC/SKIM+BURN(HIGH)" if burn else "PAIR-BURN-SYNC:BYTE-SYNC/SKIM(HIGH)"
+    if any(s in code for s in _BURN):
+        return "PAIR-BURN-SYNC:SYNC/SKIM+BURN(HIGH)"            # bytecode has BOTH sync/skim AND a burn selector -> HIGH
+    # sync/skim WITHOUT a known burn selector: hidden-burn drain (PHX) OR a LEGIT sync-caller (the $91.8M FP).
+    # Disambiguate via VERIFIED source: burn-from-pair present -> real drain; verified but ABSENT -> legit, drop.
+    src = _get_source(token)
+    if src:                                                     # verified source available -> trust it
+        return "PAIR-BURN-SYNC:SRC-BURN-FROM-PAIR(HIGH)" if _burn_from_pair(src) else None
+    return "PAIR-BURN-SYNC:UNVERIFIED-SYNC/SKIM(HIGH)"          # unverified / no key -> keep HIGH (PHX+JL hidden-burn class)
 
 def pick_token(t0, t1):
     if t1 in BASE_SET and t0 not in BASE_SET:
