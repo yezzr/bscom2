@@ -139,6 +139,35 @@ def _impl_code(token):
         if impl and int(impl, 16) != 0:
             return getcode('0x' + impl[-40:])
     return ''
+def _impl_addr(token):
+    """CURRENT EIP-1967 implementation address (direct slot, or via beacon.implementation()), else None.
+    Deliberately excludes EIP-1167 clones: a clone's impl is hardcoded in its stub bytecode and can NEVER change,
+    so caching a clone's verdict is safe. EIP-1967 proxies are UPGRADEABLE — a clean impl can be swapped for a
+    malicious one and the seen-cache would never re-score it. Recording this address is what makes a swap visible."""
+    try:
+        r = _rpc('eth_getStorageAt', [token, _EIP1967_IMPL, 'latest'])
+        if r and int(r, 16) != 0:
+            return '0x' + r[-40:]
+        b = _rpc('eth_getStorageAt', [token, _EIP1967_BEACON, 'latest'])
+        if b and int(b, 16) != 0:
+            impl = _rpc('eth_call', [{'to': '0x' + b[-40:], 'data': '0x5c60da1b'}, 'latest'])
+            if impl and int(impl, 16) != 0:
+                return '0x' + impl[-40:]
+    except Exception:
+        return None      # unreadable -> None (never fabricate an address; a wrong one would fake a "swap")
+    return None
+
+_IMPL_PASS = {}    # token -> current impl, memoised for THIS pass (the swap check reads it twice: gate + body)
+def _cur_impl(token, info):
+    """Current impl if it DIFFERS from the recorded one, else None. Memoised per pass so the gate and the body
+    don't each pay an RPC read. Returns None on an unreadable slot — a failed read must never look like a swap."""
+    if token not in _IMPL_PASS:
+        _IMPL_PASS[token] = _impl_addr(token)
+    cur = _IMPL_PASS[token]
+    if cur and cur.lower() != (info.get('impl') or '').lower():
+        return cur
+    return None
+
 def _clone_impl(code):
     """EIP-1167 minimal-proxy (clone): impl embedded in the ~45-byte stub. Scam factories mass-clone ONE
     drain impl; the stub has no sync/burn, so parse the embedded impl and scan it. Deterministic, no RPC."""
@@ -273,9 +302,68 @@ def one_pass():
             bts = bytecode_burn_sync(token, src)   # pass the already-fetched source -> verified-source FP filter
             if bts:
                 verdict.append(bts)
-            info = {'verdict': verdict, 'name': cn or name, 'pool': pool, 'alerted': False}
+            # remember WHETHER the verdict was formed without source. A fresh deploy is usually analyzed before
+            # the dev verifies it, so src='' -> the FP filter cannot run -> UNVERIFIED-SYNC/SKIM(HIGH). Cached
+            # forever, that becomes a PERMANENT false HIGH even after the source appears. (SIMP: verified later,
+            # burns its OWN balance and DONATES to the pair -> the filter drops it once source is readable.)
+            info = {'verdict': verdict, 'name': cn or name, 'pool': pool, 'alerted': False,
+                    'nosrc': not bool(src), 'impl': _impl_addr(token)}
             seen[token] = info
             analyzed += 1
+        elif info.get('impl') and _cur_impl(token, info) is not None:
+            # UPGRADEABLE proxy whose IMPLEMENTATION CHANGED since we scored it. The seen-cache scores a token
+            # exactly once, so a proxy that was clean and is later upgraded to a drain would NEVER be re-scored —
+            # and an impl swap on an already-FUNDED token is precisely the rug-via-upgrade pattern. Re-analyze the
+            # NEW impl and clear `alerted` so a newly-malicious upgrade can page. (Unreadable -> no swap claimed;
+            # never re-score on a failed read.)
+            old_impl = info.get('impl')                  # capture BEFORE overwrite (the notify prints both)
+            new_impl = _cur_impl(token, info)
+            cn3, src3 = getsrc(token)
+            v3 = []
+            if src3:
+                v3 = [x[0] + (':' + x[1] if x[1] else '') for x in run_arsenal(src3)]
+                g3, why3 = detect_buy_gate(src3)
+                if g3:
+                    v3.append('BUY-GATED:' + why3[:50])
+            bts3 = bytecode_burn_sync(token, src3)
+            if bts3:
+                v3.append(bts3)
+            print('*** IMPL SWAP %s: %s -> %s | verdict %s' % (token, old_impl, new_impl, v3), flush=True)
+            info['verdict'] = v3; info['impl'] = new_impl; info['nosrc'] = not bool(src3)
+            info['name'] = cn3 or info.get('name')
+            info['alerted'] = False            # a new impl is a NEW risk -> let the alert path re-evaluate it
+            if is_pushworthy(v3):
+                notify('BSC PROXY UPGRADE + risky\n%s\nimpl swapped %s -> %s\nliq ~$%d\n%s\nhttps://bscscan.com/token/%s'
+                       % (info.get('name') or '?', old_impl, new_impl, liq, ' '.join(v3), token))
+        elif any('UNVERIFIED' in v for v in info.get('verdict', [])) and info.get('recheck_n', 0) < 8:
+            # RE-CHECK only tokens whose verdict RESTS ON "unverified source" — the FP-prone class. Gating on the
+            # VERDICT STRING (not a new 'nosrc' field) matters twice over: (1) it works on ALREADY-CACHED entries,
+            # so SIMP — which predates the field — actually gets re-checked; (2) it's a handful of tokens, not the
+            # ~6k watched set, so we don't re-fetch source for every never-verified scam deploy on every pass
+            # (that'd be ~20min/pass at Etherscan's 5/sec and would break the Action). Capped at 8 tries: a token
+            # the dev never verifies must not be retried forever.
+            info['recheck_n'] = info.get('recheck_n', 0) + 1
+            cn2, src2 = getsrc(token)
+            if src2:
+                v2 = [x[0] + (':' + x[1] if x[1] else '') for x in run_arsenal(src2)]
+                g2, why2 = detect_buy_gate(src2)
+                if g2:
+                    v2.append('BUY-GATED:' + why2[:50])
+                bts2 = bytecode_burn_sync(token, src2)
+                if bts2:
+                    v2.append(bts2)
+                old_verdict = list(info.get('verdict', []))          # capture BEFORE overwrite
+                was_push = is_pushworthy(old_verdict) and info.get('alerted')
+                info['verdict'] = v2; info['nosrc'] = False; info['rechecked'] = True
+                info['name'] = cn2 or info.get('name')
+                if was_push and not is_pushworthy(v2):
+                    # we already paged on an unverified-source guess that the source now disproves -> RETRACT.
+                    # Leaving a false HIGH standing is how a warn-lane loses credibility.
+                    notify('BSC alert RETRACTED (source now verified)\n%s\nwas: %s\nnow: %s\n'
+                           'The earlier HIGH rested on UNVERIFIED source; published source clears it.\n'
+                           'https://bscscan.com/token/%s'
+                           % (info.get('name') or '?', ' '.join(old_verdict) or '-',
+                              ' '.join(v2) or 'clean', token))
         if token.lower() in cleared:
             continue                                            # fork-confirmed clean — never alert or review again
         if is_pushworthy(info.get('verdict', [])) and not info.get('alerted') and liq >= MIN_LIQ_USD:
