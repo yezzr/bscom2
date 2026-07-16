@@ -28,6 +28,14 @@ GT_PAGES = int(os.environ.get('GT_PAGES') or 6)              # GeckoTerminal pag
 BSC_RPC = os.environ.get('BSC_RPC') or 'https://bsc-rpc.publicnode.com'   # eth_getCode for the bytecode tell (no key needed)
 WATCH_CAP = 6000                                             # cap the seen-set so state stays small
 RISKY = {'PAIR-BURN-SYNC', 'PARKED-MINT', 'DOUBLE-SETTLE', 'BROKEN-PERMIT', 'FORCE-DUMP', 'DRAIN', 'BASKET-DEPEG'}
+# ENDEMIC-NOISE classes: fire on ordinary tokens, are NOT a user drain, and have been 100% false positives.
+#  - FORCE-DUMP: tax-token _transfer swaps its own balance with minOut==0. The only exposure is that swap being
+#    MEV-sandwiched, which costs the TOKEN'S OWN treasury, not holders. Nearly every tax token matches.
+#  - BUY-GATED (alone): an owner "enable trading" gate — that's every normal launch.
+# Kept in state + COUNTED in the heartbeat (so we still see the detector is alive) but never listed as a
+# candidate. Reviewed 2026-07-16: all 6 digest entries were FORCE-DUMP, none referenced pair sync()/skim().
+NOISE_CLASSES = {'FORCE-DUMP'}
+REVIEW_CLASSES = RISKY - NOISE_CLASSES     # what actually earns a slot in the daily digest
 # Fork-sim CONFIRMED clean/not-exploitable (round-trip PnL negative or untradable) — hard-suppressed
 # forever so they stop reappearing in the daily digest. Tokens are immutable: clean is permanent.
 CLEARED_SEED = {
@@ -233,6 +241,10 @@ def one_pass():
     st = load(STATE, {})
     seen = st.get('seen', {})          # token -> {verdict, name, pool, alerted}
     review_today = st.get('review_today', [])   # risky-but-unconfirmed tokens seen since the last heartbeat
+    # endemic FORCE-DUMP/BUY-GATED hits: counted, never listed. A SET (not a counter) because suppressed tokens
+    # are never added to `reviewed`/`review_today`, so every cron pass re-evaluates them — an int would count the
+    # same token once per pass (~48x/day) and report a wildly inflated number.
+    noise_today = set(x.lower() for x in st.get('noise_today', []))
     hb_date = st.get('hb_date', '')             # last calendar day a heartbeat digest was sent
     # PERSISTENT DEDUP: a token surfaced in a prior heartbeat digest (reviewed) or fork-confirmed
     # clean (cleared) must NEVER be re-listed — tokens are immutable, so a clean verdict is permanent.
@@ -276,14 +288,23 @@ def one_pass():
             print('*** ALERT %s (%s) $%d %s' % (token, info.get('name'), liq, info['verdict']), flush=True)
             notify('BSC fresh-deploy ALERT\n%s — %s\nliq ~$%d\n%s\ntoken: %s\nhttps://bscscan.com/token/%s'
                    % (info.get('name') or '?', rec['note'], liq, ' '.join(info['verdict']), token, token))
-        elif (liq >= MIN_LIQ_USD and not info.get('alerted') and len(review_today) < 300
-              and token.lower() not in reviewed         # NEW: never re-surface a token shown in a prior digest
-              and any(v.split(':')[0] in RISKY or v.startswith('BUY-GATED') for v in info.get('verdict', []))
+        elif (liq >= MIN_LIQ_USD and not info.get('alerted')
+              and token.lower() not in reviewed         # never re-surface a token shown in a prior digest
               and token not in {r['token'] for r in review_today}):
-            # REVIEW tier: funded + a risky/gated detector fired but NOT the high-confidence class.
-            # Tracked for the daily digest only (mostly false positives) — never an instant ping.
-            review_today.append({'token': token, 'name': info.get('name'), 'liq': round(liq),
-                                 'verdict': ' '.join(info['verdict'])[:80]})
+            vs = info.get('verdict', [])
+            classes = {v.split(':')[0] for v in vs}
+            if classes & REVIEW_CLASSES:
+                # REVIEW tier: funded + a real risky class fired but NOT the high-confidence push tier.
+                # The cap is checked INSIDE: a drain-class token must never fall through to the noise bucket
+                # just because the digest is full (it also carrying FORCE-DUMP would have mis-binned it).
+                if len(review_today) < 300:
+                    review_today.append({'token': token, 'name': info.get('name'), 'liq': round(liq),
+                                         'verdict': ' '.join(vs)[:80]})
+            elif (classes & NOISE_CLASSES) or any(v.startswith('BUY-GATED') for v in vs):
+                # endemic pattern (sandwichable tax-swap / trading gate) -> COUNT it so we know the detector is
+                # alive, but never list it. Listing these is what made the digest 100% noise.
+                if len(noise_today) < 20000:            # bound state growth if a digest ever fails to fire
+                    noise_today.add(token.lower())
     # prune the seen-set: always keep alerted, then newest others up to the cap
     if len(seen) > WATCH_CAP:
         alerted = {k: v for k, v in seen.items() if v.get('alerted')}
@@ -296,11 +317,15 @@ def one_pass():
         top = sorted(review_today, key=lambda r: -r['liq'])[:10]
         lines = ['BSC monitor — daily heartbeat ✅ alive.',
                  'Scanned %d pools, watching %d tokens, %d confirmed alerts all-time.' % (len(pools), len(seen), len(alerts)),
-                 '%d REVIEW candidates in the last ~day (risky-but-UNCONFIRMED — mostly false positives, eyeball only):' % len(review_today)]
+                 '%d REVIEW candidates in the last ~day (drain-class only — eyeball):' % len(review_today)]
         for r in top:
             lines.append('· %s $%d [%s] bscscan.com/token/%s' % (r['name'] or '?', r['liq'], r['verdict'], r['token']))
         if not top:
-            lines.append('(none new tripped even the review tier — quiet day)')
+            lines.append('(no drain-class candidates — quiet day)')
+        if noise_today:
+            # observability without noise: prove the detectors ran without pasting endemic tax tokens
+            lines.append('(+%d endemic FORCE-DUMP/BUY-GATED hits suppressed — sandwichable tax-swap, not a user drain)'
+                         % len(noise_today))
         notify('\n'.join(lines))
         # mark everything surfaced this digest as reviewed so it NEVER repeats in a future heartbeat
         for r in review_today:
@@ -308,8 +333,9 @@ def one_pass():
         if len(reviewed) > 20000:                       # bound the ledger (addresses only)
             reviewed = set(list(reviewed)[-20000:])
         review_today = []
+        noise_today = set()                             # reset with the digest window, else it grows forever
         hb_date = today
-    json.dump({'seen': seen, 'review_today': review_today, 'hb_date': hb_date,
+    json.dump({'seen': seen, 'review_today': review_today, 'noise_today': sorted(noise_today), 'hb_date': hb_date,
                'reviewed': sorted(reviewed), 'cleared': sorted(cleared)}, open(STATE, 'w'))
     json.dump(alerts, open(ALERTS, 'w'), indent=1)
     print('%s | pools(GT+DS) %d | newly analyzed %d | seen %d | review %d | alerts this pass %d (total %d)'
