@@ -21,8 +21,27 @@ os.makedirs(HOME, exist_ok=True)
 STATE = os.path.join(HOME, "pairwatch_state.json")
 ALERTS = os.path.join(HOME, "pairwatch_alerts.json")
 MIN_LIQ_USD = float(os.environ.get("MIN_LIQ_USD") or 1000)
-MAX_CATCHUP = int(os.environ.get("PW_MAX_CATCHUP") or 20000)   # cap a huge backlog (long outage) so one run can't run forever
-CHUNK = 50                                                     # 1rpc/publicnode getLogs cap
+MAX_CATCHUP = int(os.environ.get("PW_MAX_CATCHUP") or 200000)
+# ^ blocks of backlog one run will accept before JUMPING AHEAD AND PERMANENTLY DROPPING the rest. This is the
+# only place the scanner knowingly loses coverage, so the number has to be honest about BSC's real block rate.
+# WAS 20000, chosen when BSC made a block every ~3s => ~16h of chain (a sane outage cap). BSC now blocks every
+# ~0.45s (~8,000/hour), so 20000 silently became just 2.5 HOURS — shorter than GitHub's own cron throttling
+# (observed 1-3h gaps between */10 runs). Combined with the old CHUNK=50 (which couldn't keep pace), the scanner
+# ran chronically behind, blew this cap routinely, and dropped fresh pairs FOREVER. 200000 = ~25h of chain, and
+# at CHUNK=2000 that is only ~100 getLogs calls (~2-3 min) — affordable, and no gap for any outage under a day.
+CHUNK = 2000        # drpc's getLogs cap. WHY THIS MATTERS: BSC now produces a block every ~0.45s (~8,000/hour),
+                    # ~6.7x faster than the ~3s this was designed against. At the old CHUNK=50 (sized for the
+                    # WORST node, 1rpc/publicnode) each call covered just 23 SECONDS of chain -> 160 calls/hour,
+                    # and GitHub throttles the */10 cron to real gaps of 1-3h => 320-479 sequential calls per run.
+                    # get_paircreated stops at the first failed chunk, so one rate-limit hiccup leaves it behind,
+                    # which makes the next range bigger -> a lag death-spiral, and fresh pairs are never reached.
+                    # drpc serves 2000 blocks/call (~15 min of chain) = 40x throughput; SUB_CHUNK is the fallback
+                    # for the 50-cap nodes so a drpc outage degrades instead of failing.
+SUB_CHUNK = 50                                                 # 1rpc/publicnode getLogs cap (fallback only)
+RUN_BUDGET_S = int(os.environ.get("PW_RUN_BUDGET_S") or 420)   # 7 min of scanning; workflow timeout is 15 min.
+                                                               # The scan is time-boxed and commits partial
+                                                               # progress so a backlog is worked off across runs
+                                                               # instead of timing out and committing NOTHING.
 
 # UniV2-style factories (all share the PairCreated topic + data layout)
 FACTORIES = [
@@ -33,14 +52,40 @@ FACTORIES = [
     "0x01bf7c66c6bd861915cdaae475042d3c4bae16a7",  # BakerySwap
 ]
 WBNB = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"
-BASES = [("0x55d398326f99059ff775485246999027b3197955", 1.0),   # USDT
-         ("0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", 1.0),   # USDC
-         ("0xe9e7cea3dedca5984780bafc599bd69add087d56", 1.0),   # BUSD
-         (WBNB, None)]                                          # None => BNB price
+# Base/quote tokens a fresh pair can be funded in. base_liq_usd reads how much of THESE the pair holds -> USD.
+# WHY THIS LIST MATTERS (measured 2026-07-17): with only USDT/USDC/BUSD/WBNB, a burn-sync token paired against
+# any OTHER base read $0 liquidity -> looked UNFUNDED -> NEVER alerted (a $2,637 pool scored $0). Fresh BSC
+# tokens increasingly quote in FDUSD/USD1 (new stables) and CAKE/ETH/BTCB. All are 18-decimals on BSC.
+BASES = [("0x55d398326f99059ff775485246999027b3197955", 1.0),   # USDT  (stable)
+         ("0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", 1.0),   # USDC  (stable)
+         ("0xe9e7cea3dedca5984780bafc599bd69add087d56", 1.0),   # BUSD  (stable)
+         ("0xc5f0f7b66764f6ec8c8dff7ba683102295e16409", 1.0),   # FDUSD (stable, newer)
+         ("0x8d0d000ee44948fc98c9b98a4fa4921476f08b0d", 1.0),   # USD1  (stable, newer)
+         (WBNB, None),                                          # None => live BNB price
+         ("0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82", "L"),   # CAKE  ("L" => live price lookup)
+         ("0x2170ed0880ac9a755fd29b2688956bd959f933f8", "L"),   # ETH
+         ("0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c", "L")]   # BTCB
 BASE_SET = {a for a, _ in BASES}
+_LIVE_PX = {}          # addr -> USD, fetched once per process for the "L" bases (CAKE/ETH/BTCB)
+
+def _base_price(tok, price, bnb):
+    """USD price for a base token: fixed for stables, live BNB for WBNB, live lookup (cached) for CAKE/ETH/BTCB.
+    Unknown/failed lookup -> 0.0 (NEVER fabricate a price; that would invent liquidity that isn't there)."""
+    if price is None:
+        return bnb
+    if price != "L":
+        return price
+    if tok not in _LIVE_PX:
+        try:
+            r = json.loads(urllib.request.urlopen(
+                "https://api.geckoterminal.com/api/v2/simple/networks/bsc/token_price/" + tok, timeout=10).read())
+            _LIVE_PX[tok] = float(list(r["data"]["attributes"]["token_prices"].values())[0])
+        except Exception:
+            _LIVE_PX[tok] = 0.0        # couldn't price -> don't count this base (fail safe, not fail loud)
+    return _LIVE_PX[tok]
 
 # getLogs-capable nodes (50-block chunks); general RPC nodes for getCode/eth_call (no range limit)
-LOG_RPCS = ["https://1rpc.io/bnb", "https://bsc-rpc.publicnode.com", "https://bsc.drpc.org"]
+LOG_RPCS = ["https://bsc.drpc.org", "https://1rpc.io/bnb", "https://bsc-rpc.publicnode.com"]  # drpc first: 2000-block range
 GEN_RPCS = ["https://bsc-rpc.publicnode.com", "https://bsc-dataseed.bnbchain.org",
             "https://bsc-dataseed1.defibit.io", "https://1rpc.io/bnb"]
 if os.environ.get("ALCHEMY_KEY"):
@@ -69,14 +114,45 @@ def head_block():
     r = _rpc(GEN_RPCS, "eth_blockNumber", [])
     return int(r, 16) if r else None
 
-def get_paircreated(frm, to):
-    """PairCreated logs across all V2 factories in [frm,to] via 50-block chunks. Returns [(token0,token1,pair)]."""
+def get_paircreated(frm, to, deadline=None):
+    """PairCreated logs across all V2 factories in [frm,to] via CHUNK-block getLogs. Returns ([(t0,t1,pair)], scanned).
+
+    `deadline` (unix ts) time-boxes the scan: on hitting it we return the blocks scanned SO FAR, the caller commits
+    that as last_block, and the next run resumes there. This is what stops a big backlog from killing the runner:
+    state is only saved at the END of a run, so a run that exceeds the workflow timeout commits NOTHING, retries the
+    same range, and times out again -> the scanner deadlocks permanently. Measured: a 200k-block backlog is ~1,700
+    pairs = ~57 min of scanning + ~25 min of analysis vs a 15-min timeout. Partial progress beats a dead scanner.
+    """
     out = []
     b = frm
     while b <= to:
+        if deadline and time.time() > deadline:
+            print(f"  deadline hit at block {b}; committing through {b-1}, next run resumes there", flush=True)
+            return out, b - 1              # partial progress COMMITTED -> no gap, no deadlock
         e = min(b + CHUNK - 1, to)
         logs = _rpc(LOG_RPCS, "eth_getLogs",
                     [{"fromBlock": hex(b), "toBlock": hex(e), "address": FACTORIES, "topics": [PAIRCREATED]}])
+        if logs is None and CHUNK > SUB_CHUNK:
+            # the wide chunk failed (drpc down / range rejected) -> re-try the SAME range in 50-block sub-chunks
+            # so the capped nodes can still serve it. Degrade, don't stall.
+            logs = []
+            sb = b
+            while sb <= e:
+                if deadline and time.time() > deadline:
+                    # the deadline must be checked HERE too: when drpc is down we grind 40 sub-chunks per outer
+                    # chunk, and checking only between 2000-block chunks let one stuck chunk blow the whole run
+                    # budget -> overshoot the 15-min timeout -> commit nothing -> deadlock (the exact failure the
+                    # budget exists to stop). Commit what the sub-loop scanned and resume next run.
+                    print(f"  deadline hit mid-sub-chunk at {sb}; committing through {sb-1}", flush=True)
+                    return out, sb - 1
+                se = min(sb + SUB_CHUNK - 1, e)
+                part = _rpc(LOG_RPCS, "eth_getLogs",
+                            [{"fromBlock": hex(sb), "toBlock": hex(se), "address": FACTORIES, "topics": [PAIRCREATED]}])
+                if part is None:
+                    print(f"  getLogs FAILED at {sb}-{se}; committing through {sb-1}, re-scan next run", flush=True)
+                    return out, sb - 1      # commit only fully-scanned blocks
+                logs.extend(part)
+                sb = se + 1
         if logs is None:                    # ALL nodes failed this chunk (None != empty []). DON'T advance past it:
             print(f"  getLogs FAILED at {b}-{e}; committing through {b-1}, re-scan next run", flush=True)
             return out, b - 1               # commit only fully-scanned blocks -> failed range re-scanned next run
@@ -173,7 +249,7 @@ def base_liq_usd(pair, bnb):
     for tok, price in BASES:
         r = _rpc(GEN_RPCS, "eth_call", [{"to": tok, "data": "0x70a08231" + pair[2:].rjust(64, "0")}, "latest"])
         bal = int(r, 16) if r and r != "0x" else 0
-        usd = bal / 1e18 * (bnb if price is None else price)
+        usd = bal / 1e18 * _base_price(tok, price, bnb)      # stable=$1, WBNB=live BNB, CAKE/ETH/BTCB=live lookup
         if usd > best:
             best = usd
     return best
@@ -200,6 +276,7 @@ def notify(text):
             pass
 
 def main():
+    _t0 = time.time()          # run start -> the scan deadline (_t0 + RUN_BUDGET_S) time-boxes this pass
     st = {}
     if os.path.exists(STATE):
         try:
@@ -216,13 +293,22 @@ def main():
         print("no head - all RPCs down this pass", flush=True); return
     last = st.get("last_block") or (head - 300)          # first run: last ~5 min
     if head - last > MAX_CATCHUP:                          # long outage: cap the backlog
-        print(f"backlog {head-last} > cap {MAX_CATCHUP}; jumping ahead (accepting one gap)", flush=True)
+        dropped = head - last - MAX_CATCHUP
+        print(f"backlog {head-last} > cap {MAX_CATCHUP}; jumping ahead (DROPPING {dropped} blocks)", flush=True)
+        # A dropped range is a COVERAGE HOLE — tokens in it are never scanned. FCOW was missed exactly this way,
+        # silently, while every run reported success. If we ever drop, SAY SO.
+        notify("BSC pairwatch COVERAGE GAP\n"
+               "backlog %d blocks > cap %d -> DROPPED %d blocks (~%.1f h of chain).\n"
+               "Pairs created in that range were NEVER scanned. Scanner is falling behind."
+               % (head - last, MAX_CATCHUP, dropped, dropped * 0.45 / 3600))
         last = head - MAX_CATCHUP
     frm = last + 1
     if frm > head:                                         # no new blocks (or stale head): skip scan but STILL
         pairs, scanned = [], last                          # re-check pending below (it's TIME-based, not block-based)
     else:
-        pairs, scanned = get_paircreated(frm, head)        # `scanned` may be < head if a chunk's getLogs failed
+        pairs, scanned = get_paircreated(frm, head, deadline=_t0 + RUN_BUDGET_S)   # `scanned` may be < head if a
+                                                           # chunk failed OR the run budget expired (both commit
+                                                           # only fully-scanned blocks -> resume, never a gap)
     print(f"scan {frm}..{scanned} -> {len(pairs)} PairCreated", flush=True)
     bnb = _bnb()
     fired = 0

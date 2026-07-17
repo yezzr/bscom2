@@ -24,7 +24,14 @@ os.makedirs(HOME, exist_ok=True)               # never crash on a missing state 
 STATE = os.path.join(HOME, 'bsc_forward_state.json')
 ALERTS = os.path.join(HOME, 'bsc_forward_alerts.json')
 MIN_LIQ_USD = float(os.environ.get('MIN_LIQ_USD') or 1000)   # alert once a risky token has >=$1k drainable liquidity (user-specified floor)
-GT_PAGES = int(os.environ.get('GT_PAGES') or 6)              # GeckoTerminal pages per endpoint
+GT_PAGES = int(os.environ.get('GT_PAGES') or 10)             # GeckoTerminal serves 10 pages of new_pools (200)
+MON_BUDGET_S = int(os.environ.get('MON_BUDGET_S') or 480)    # per-pass analysis budget. WHY: state is saved ONLY
+# at the end of one_pass(); a COLD START (fresh deploy / GitHub cache eviction) analyses every token — measured
+# ~456s for 141 tokens, i.e. ~3.2s/token (getsrc is Etherscan-rate-limited) — so a ~244-token set is ~13min,
+# past the workflow's 10-min (600s) timeout. A timeout kills the run BEFORE the save, so nothing commits and the
+# next run repeats the same cold start => permanent deadlock (the exact bug just fixed in pairwatch). This budget
+# stops analysing new tokens partway, lets the pass SAVE what it did, and the rest are picked up next pass (a
+# token not yet in `seen` is simply re-analysed later). 480s leaves headroom under 600s for the heartbeat+save tail.
 BSC_RPC = os.environ.get('BSC_RPC') or 'https://bsc-rpc.publicnode.com'   # eth_getCode for the bytecode tell (no key needed)
 WATCH_CAP = 6000                                             # cap the seen-set so state stays small
 RISKY = {'PAIR-BURN-SYNC', 'PARKED-MINT', 'DOUBLE-SETTLE', 'BROKEN-PERMIT', 'FORCE-DUMP', 'DRAIN', 'BASKET-DEPEG'}
@@ -206,7 +213,13 @@ def bytecode_burn_sync(token, src=None):
     return 'PAIR-BURN-SYNC:UNVERIFIED-SYNC/SKIM(HIGH)'   # unverified -> keep HIGH (hidden-burn class)
 
 def gt_pools():
-    """token(lower) -> (pool, liq_usd, name). Fresh + trending BSC pools from GeckoTerminal."""
+    """token(lower) -> (pool, liq_usd, name). Fresh + trending BSC pools from GeckoTerminal.
+
+    RATE LIMIT (measured 2026-07-17): GeckoTerminal allows ~30 calls/min. This slept 0.6s between pages =
+    ~100/min, so it was being 429'd PART-WAY THROUGH every pass and silently returning partial pools — the
+    feed looked fine, it just quietly stopped early. (It also fooled me into declaring trending_pools "dead":
+    a burst test 429'd it to 0 rows. Spaced out it serves 20/page.) 2.5s/page keeps us inside the limit;
+    GT_PAGES=10 x 2 endpoints x 2.5s = ~50s per pass, which is nothing on a 10-min cron."""
     out = {}
     for path in ('new_pools', 'trending_pools'):
         for pg in range(1, GT_PAGES + 1):
@@ -224,7 +237,7 @@ def gt_pools():
                         out[a] = (pool, liq, nm)
             if not rows:
                 break
-            time.sleep(0.6)
+            time.sleep(2.5)          # GT allows ~30 calls/min; 0.6s = 100/min = silent 429s mid-pass
     return out
 
 def ds_pools():
@@ -234,14 +247,20 @@ def ds_pools():
     out = {}
     toks = []
     try:
-        for url in ('https://api.dexscreener.com/token-profiles/latest/v1',
-                    'https://api.dexscreener.com/token-boosts/latest/v1'):
-            d = jget(url)
-            for it in (d if isinstance(d, list) else []):
-                if (it.get('chainId') or '').lower() == 'bsc':
-                    ta = (it.get('tokenAddress') or '').lower()
-                    if ta:
-                        toks.append(ta)
+        # MEASURED 2026-07-17: token-profiles/latest and token-boosts/latest are PAID-PROMOTION feeds — 30 items
+        # each, ZERO on BSC — so this whole lane returned {} and contributed nothing while looking alive. The
+        # search endpoint actually returns live BSC pairs; query the quote assets every BSC pair is priced in.
+        for q in ('WBNB', 'USDT', 'USDC', 'BUSD', 'CAKE'):
+            d = jget('https://api.dexscreener.com/latest/dex/search?q=' + q)
+            for p in (d.get('pairs') or []):
+                if (p.get('chainId') or '').lower() != 'bsc':
+                    continue
+                base = ((p.get('baseToken') or {}).get('address') or '').lower()
+                pool = p.get('pairAddress') or ''
+                liq = float(((p.get('liquidity') or {}).get('usd')) or 0)
+                nm = (p.get('baseToken') or {}).get('symbol') or ''
+                if base and pool and (base not in out or liq > out[base][1]):
+                    out[base] = (pool, liq, nm)          # search already carries pool+liq: no second lookup needed
             time.sleep(0.4)
         toks = list(dict.fromkeys(toks))                       # dedup, keep order
         for i in range(0, len(toks), 30):                      # DexScreener tokens endpoint takes up to 30 comma-joined
@@ -266,20 +285,32 @@ def load(p, d):
     except Exception:
         return d
 
+def _str_set(v):
+    """Coerce a persisted value into a set of lowercased address strings, tolerating ANY legacy/corrupt shape.
+    WHY: new code loads OLD cached state on deploy. noise_today shipped first as an INT counter, later as a set
+    (stored as a sorted list); `set(x.lower() for x in <int>)` -> TypeError -> the monitor crashes EVERY run on
+    the old cache = dead on arrival. Never trust the stored type; degrade to empty rather than crash."""
+    if isinstance(v, (list, tuple, set)):
+        return {str(x).lower() for x in v if isinstance(x, str)}
+    return set()
+
 def one_pass():
+    _t0 = time.time()          # per-pass clock -> MON_BUDGET_S time-boxes new-token analysis (cold-start guard)
     st = load(STATE, {})
     seen = st.get('seen', {})          # token -> {verdict, name, pool, alerted}
-    review_today = st.get('review_today', [])   # risky-but-unconfirmed tokens seen since the last heartbeat
+    if not isinstance(seen, dict):     # legacy/corrupt state (e.g. seen persisted as a list) -> seen.get() would
+        seen = {}                      # crash on every token; reset rather than die (tokens re-analysed next pass)
+    review_today = st.get('review_today', []) if isinstance(st.get('review_today'), list) else []   # risky-but-unconfirmed since last heartbeat
     # endemic FORCE-DUMP/BUY-GATED hits: counted, never listed. A SET (not a counter) because suppressed tokens
     # are never added to `reviewed`/`review_today`, so every cron pass re-evaluates them — an int would count the
     # same token once per pass (~48x/day) and report a wildly inflated number.
-    noise_today = set(x.lower() for x in st.get('noise_today', []))
+    noise_today = _str_set(st.get('noise_today'))     # tolerant of the legacy INT-counter shape (would crash)
     hb_date = st.get('hb_date', '')             # last calendar day a heartbeat digest was sent
     # PERSISTENT DEDUP: a token surfaced in a prior heartbeat digest (reviewed) or fork-confirmed
     # clean (cleared) must NEVER be re-listed — tokens are immutable, so a clean verdict is permanent.
     # This kills the "same tokens reported every single day" noise.
-    reviewed = set(x.lower() for x in st.get('reviewed', []))    # already shown in a past digest
-    cleared = set(x.lower() for x in st.get('cleared', [])) | CLEARED_SEED   # fork-confirmed clean / not-exploitable, hard-suppress
+    reviewed = _str_set(st.get('reviewed'))                      # already shown in a past digest
+    cleared = _str_set(st.get('cleared')) | CLEARED_SEED         # fork-confirmed clean / not-exploitable, hard-suppress
     alerts = load(ALERTS, [])
     pools = gt_pools()
     for token, (pool, liq, name) in ds_pools().items():        # union DexScreener (max liquidity per token)
@@ -287,7 +318,14 @@ def one_pass():
             pools[token] = (pool, liq, name)
     analyzed = 0
     fired = 0
+    budget_hit = False
     for token, (pool, liq, name) in pools.items():
+        if time.time() - _t0 > MON_BUDGET_S:
+            # out of time this pass -> STOP analysing (break, don't return) so the heartbeat + state save still
+            # run and commit what we did. Un-analysed tokens aren't in `seen`, so next pass picks them up.
+            budget_hit = True
+            print('budget %ds hit; analysed %d, deferring rest to next pass' % (MON_BUDGET_S, analyzed), flush=True)
+            break
         info = seen.get(token)
         if info is None:
             cn, src = getsrc(token)     # Etherscan source (no RPC)
