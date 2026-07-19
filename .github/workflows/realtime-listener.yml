@@ -8,20 +8,26 @@ name: realtime-listener
 # quota. Public repos have UNLIMITED Actions minutes. Secrets stay in GitHub Secrets (never in code).
 on:
   schedule:
-    - cron: '0 */6 * * *'     # restart every 6h (job self-exits at ~5h50m, leaving a ~10-min gap)
+    # GAP-2 FIX: OVERLAPPING restarts = ZERO downtime. cron every 5h, job runs ~5h10m -> the next job starts
+    # ~10 min BEFORE the current one exits, so a listener is ALWAYS up across the handoff (was: 6h cron + 5h50m
+    # job = a 10-min gap every 6h, during which a fast create->fund->drain could beat the poll). Every consecutive
+    # cron gap (<=5h) is shorter than the job (5h10m) -> guaranteed overlap.
+    - cron: '0 */5 * * *'
   workflow_dispatch: {}        # start it manually anytime
 
 permissions:
   contents: read
 
 concurrency:
-  group: realtime-listener
-  cancel-in-progress: false    # don't kill a running listener when the next cron fires
+  # PER-RUN group so scheduled runs OVERLAP instead of serializing. The old single group `realtime-listener`
+  # (cancel-in-progress:false) QUEUED the next run until the current exited -> overlap impossible -> the gap.
+  group: realtime-listener-${{ github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   listen:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 315
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -37,9 +43,16 @@ jobs:
           ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}   # for contract-source fetches in the arsenal
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # DEAD-MAN'S-SWITCH (optional): create a free healthchecks.io check, add its ping URL as this secret.
+          # The listener pings it every ~5s; if BOTH overlapping jobs die, pings stop and healthchecks alerts you.
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
           CONFIRM: '0'          # v1: precise classes ping instantly; FORCE-DUMP logged-not-pinged
                                 # (fork-sim confirm needs foundry on the runner — a later add)
         run: |
           cd bscmon
-          # 5h50m = 21000s; exit cleanly before the 355-min job cap so the next cron restarts fresh
-          timeout 21000 python -u bsc_realtime_listener.py || echo "listener exited (timeout/restart) — next cron will relaunch"
+          # 5h10m = 18600s. cron every 5h -> the next job starts ~10 min before this one exits. That 10-min
+          # overlap is deliberately GENEROUS: GitHub job startup (runner assign + container + pip + WS connect) is
+          # VARIABLE and can take 2-3 min, so a 2-min overlap could leave a real gap. 10 min guarantees the new
+          # listener is connected before the old exits, at the cost of rare duplicate pings in that window
+          # (a far better failure mode than a coverage gap). Stays under the 315-min cap.
+          timeout 18600 python -u bsc_realtime_listener.py || echo "listener exited (timeout/restart) — next cron overlaps"
