@@ -35,6 +35,14 @@ jobs:
           python-version: '3.12'
       - name: Install deps
         run: pip install websockets
+      - name: Diagnose ALCHEMY_KEY reaching the job (LENGTH ONLY — value is never printed)
+        env:
+          ALCHEMY_KEY: ${{ secrets.ALCHEMY_KEY }}
+        run: |
+          echo "ALCHEMY_KEY length as seen by this job = ${#ALCHEMY_KEY}"
+          echo "  -> 0  = the secret is NOT reaching the job (name/scope/access — GitHub side)"
+          echo "  -> ~20 = the secret IS reaching the job (then the flaky ping was a stale/pre-secret run)"
+
       - name: Run listener (bounded to ~5h50m, then exits cleanly for the next cron)
         env:
           # ALCHEMY_KEY (SECRET, not in code) = reliable BSC log streaming; without it, falls back to flaky
