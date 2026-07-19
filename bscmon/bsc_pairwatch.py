@@ -114,8 +114,25 @@ def head_block():
     r = _rpc(GEN_RPCS, "eth_blockNumber", [])
     return int(r, 16) if r else None
 
+KNOWN_FACTORIES = {f.lower() for f in FACTORIES}   # trusted -> no validation needed
+_VALIDATED_FACT = set()      # unknown factories proven real this process (pair.factory() points back)
+_REJECTED_FACT = set()       # spoofers (fake PairCreated emitters) -> cheap skip after one check
+
+def _pair_factory(pair):
+    """factory() on a pair. A REAL UniV2 pair returns the factory that created it; a spoofed 'pair' (random
+    contract that merely emitted a PairCreated log) does not -> lets us safely scan ALL PairCreated instead of a
+    hardcoded allowlist, without a DoS surface. None on failure."""
+    r = _rpc(GEN_RPCS, "eth_call", [{"to": pair, "data": "0xc45a0155"}, "latest"])   # factory()
+    try:
+        return ("0x" + r[-40:]).lower() if r and int(r, 16) != 0 else None
+    except Exception:
+        return None
+
 def get_paircreated(frm, to, deadline=None):
-    """PairCreated logs across all V2 factories in [frm,to] via CHUNK-block getLogs. Returns ([(t0,t1,pair)], scanned).
+    """PairCreated logs across ALL V2 factories in [frm,to] via CHUNK-block getLogs. Returns ([(t0,t1,pair)], scanned).
+    GAP-1 FIX: no factory allowlist. We scan EVERY PairCreated event (auto-covers present+future V2 DEXes, not just
+    5 hardcoded factories), and validate an UNKNOWN emitter ONCE via pair.factory()==emitter (cached) so spoofed
+    events can't DoS us. Known factories are fast-pathed (no validation call).
 
     `deadline` (unix ts) time-boxes the scan: on hitting it we return the blocks scanned SO FAR, the caller commits
     that as last_block, and the next run resumes there. This is what stops a big backlog from killing the runner:
@@ -131,7 +148,7 @@ def get_paircreated(frm, to, deadline=None):
             return out, b - 1              # partial progress COMMITTED -> no gap, no deadlock
         e = min(b + CHUNK - 1, to)
         logs = _rpc(LOG_RPCS, "eth_getLogs",
-                    [{"fromBlock": hex(b), "toBlock": hex(e), "address": FACTORIES, "topics": [PAIRCREATED]}])
+                    [{"fromBlock": hex(b), "toBlock": hex(e), "topics": [PAIRCREATED]}])
         if logs is None and CHUNK > SUB_CHUNK:
             # the wide chunk failed (drpc down / range rejected) -> re-try the SAME range in 50-block sub-chunks
             # so the capped nodes can still serve it. Degrade, don't stall.
@@ -147,7 +164,7 @@ def get_paircreated(frm, to, deadline=None):
                     return out, sb - 1
                 se = min(sb + SUB_CHUNK - 1, e)
                 part = _rpc(LOG_RPCS, "eth_getLogs",
-                            [{"fromBlock": hex(sb), "toBlock": hex(se), "address": FACTORIES, "topics": [PAIRCREATED]}])
+                            [{"fromBlock": hex(sb), "toBlock": hex(se), "topics": [PAIRCREATED]}])
                 if part is None:
                     print(f"  getLogs FAILED at {sb}-{se}; committing through {sb-1}, re-scan next run", flush=True)
                     return out, sb - 1      # commit only fully-scanned blocks
@@ -160,8 +177,18 @@ def get_paircreated(frm, to, deadline=None):
             tp = lg.get("topics") or []
             data = lg.get("data") or ""
             if len(tp) >= 3 and len(data) >= 66:
-                t0 = "0x" + tp[1][-40:]; t1 = "0x" + tp[2][-40:]; pair = "0x" + data[2:66][-40:]
-                out.append((t0.lower(), t1.lower(), pair.lower()))
+                t0 = "0x" + tp[1][-40:]; t1 = "0x" + tp[2][-40:]; pair = ("0x" + data[2:66][-40:]).lower()
+                emitter = (lg.get("address") or "").lower()
+                if emitter in KNOWN_FACTORIES or emitter in _VALIDATED_FACT:
+                    pass                                     # trusted factory
+                elif emitter in _REJECTED_FACT:
+                    continue                                 # known spoofer -> cheap skip
+                elif _pair_factory(pair) == emitter:         # NEW factory: validate once (pair points back)
+                    _VALIDATED_FACT.add(emitter)
+                    print(f"  [new factory validated: {emitter}]", flush=True)
+                else:
+                    _REJECTED_FACT.add(emitter); continue    # spoofed PairCreated -> reject + cache
+                out.append((t0.lower(), t1.lower(), pair))
         b = e + 1
     return out, to
 

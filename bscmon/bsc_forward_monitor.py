@@ -110,16 +110,31 @@ def jget(url):
             time.sleep(0.8)
     return {}
 
+_CODE_RPCS = [BSC_RPC, 'https://bsc-dataseed.bnbchain.org', 'https://bsc.drpc.org',
+              'https://bsc-rpc.publicnode.com', 'https://1rpc.io/bnb']
 def getcode(token):
-    """Runtime bytecode via eth_getCode (public node, no key). '' on failure — never crash a pass."""
-    try:
-        payload = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'eth_getCode',
-                              'params': [token, 'latest']}).encode()
-        req = urllib.request.Request(BSC_RPC, payload, {'Content-Type': 'application/json',
-                                                        'User-Agent': 'Mozilla/5.0'})
-        return (json.loads(urllib.request.urlopen(req, timeout=15).read()).get('result') or '').lower()
-    except Exception:
-        return ''
+    """Runtime bytecode via eth_getCode. Rotates over multiple nodes with a retry: a SINGLE flaky call that
+    returned '' was read by bytecode_burn_sync as 'no sync selectors -> clean' = a silent false-negative on the
+    exact drain class, worst on the keyless realtime lane. '0x' (genuinely no code) is a valid answer and returned;
+    '' is returned ONLY if every node failed to answer (so callers can tell 'no code' from 'couldn't read')."""
+    payload = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'eth_getCode',
+                          'params': [token, 'latest']}).encode()
+    seen = []
+    for url in _CODE_RPCS:
+        if not url or url in seen:
+            continue
+        seen.append(url)
+        for _ in range(2):
+            try:
+                req = urllib.request.Request(url, payload, {'Content-Type': 'application/json',
+                                                            'User-Agent': 'Mozilla/5.0'})
+                r = json.loads(urllib.request.urlopen(req, timeout=15).read())
+                res = r.get('result')
+                if res is not None:                 # a real answer ('0x' for EOA is valid) -> done
+                    return res.lower()
+            except Exception:
+                time.sleep(0.3)
+    return ''                                       # every node failed -> UNREADABLE (not 'no code')
 
 # Burn selectors seen in the pair-burn-sync drain family (JL/BYToken/AIDC/STO). We do NOT rely on
 # function NAMES (JL's burn entry is a hidden 0xb1faeac6) — any of these present alongside sync/skim is the tell.
@@ -199,8 +214,13 @@ def bytecode_burn_sync(token, src=None):
     known burn selector could be a hidden-burn drain (PHX) OR a LEGIT sync-caller (e.g. a rebase/LP token). When
     VERIFIED source is available, require the burn-from-pair pattern for HIGH; verified-but-absent -> legit, drop
     (kills the $91.8M-token class of FP). Unverified -> keep HIGH (can't disambiguate; the JL/PHX hidden-burn case)."""
-    own = getcode(token) or ''
-    code = own + _impl_code(token)                       # + EIP-1967 direct/beacon impl
+    own = getcode(token)
+    if own == '':
+        # every RPC failed to return code for a token we're actively analysing (it has a funded pair, so it MUST
+        # have code). Empty here = UNREADABLE, not 'no code' -> do NOT silently clear it (the false-negative that
+        # hid the drain class on the flaky realtime lane). Surface for re-check instead.
+        return 'PAIR-BURN-SYNC:CODE-UNREADABLE-RECHECK(HIGH)'
+    code = own + (_impl_code(token) or '')               # + EIP-1967 direct/beacon impl
     ci = _clone_impl(own)                                # + EIP-1167 minimal-proxy clone impl
     if ci:
         code += (getcode(ci) or '')
@@ -373,7 +393,7 @@ def one_pass():
             if is_pushworthy(v3):
                 notify('BSC PROXY UPGRADE + risky\n%s\nimpl swapped %s -> %s\nliq ~$%d\n%s\nhttps://bscscan.com/token/%s'
                        % (info.get('name') or '?', old_impl, new_impl, liq, ' '.join(v3), token))
-        elif any('UNVERIFIED' in v for v in info.get('verdict', [])) and info.get('recheck_n', 0) < 8:
+        elif any(('UNVERIFIED' in v or 'RECHECK' in v) for v in info.get('verdict', [])) and info.get('recheck_n', 0) < 8:
             # RE-CHECK only tokens whose verdict RESTS ON "unverified source" — the FP-prone class. Gating on the
             # VERDICT STRING (not a new 'nosrc' field) matters twice over: (1) it works on ALREADY-CACHED entries,
             # so SIMP — which predates the field — actually gets re-checked; (2) it's a handful of tokens, not the

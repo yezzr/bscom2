@@ -28,6 +28,12 @@ try:
     try: from bsc_forward_monitor import detect_buy_gate
     except Exception:
         def detect_buy_gate(s): return (False, '')
+    # BYTECODE detector (unverified-safe). WITHOUT this the realtime lane skipped every UNVERIFIED token
+    # ("v1; bytecode mode is a later add") -> blind to the FCOW/0x8837 pair-burn-sync class in real time,
+    # which is the exact class that drained. This is the whole point of the fast lane.
+    try: from bsc_forward_monitor import bytecode_burn_sync
+    except Exception:
+        def bytecode_burn_sync(token, src=None): return None
 except Exception:
     def notify(t): print('[NOTIFY]', t)
     def is_pushworthy(v):
@@ -36,6 +42,7 @@ except Exception:
             if x.split(':')[0]=='PAIR-BURN-SYNC' and 'HIGH' in x: return True
         return False
     def detect_buy_gate(s): return (False, '')
+    def bytecode_burn_sync(token, src=None): return None
 
 # Endpoints: prefer Alchemy (reliable log streaming) when ALCHEMY_KEY is set as a SECRET (safe on a public
 # repo — it's not in code); fall back to keyless publicnode. publicnode's free pool is flaky for log subs.
@@ -105,16 +112,27 @@ def fork_confirm(token, pair, liq):
 pending = {}                 # pair(lower) -> (token0, token1, first_ts)
 plock = threading.Lock()
 POLL_EVERY = 20              # re-check pending pairs' liquidity this often (s)
+HTTP_POLL_EVERY = int(os.environ.get('HTTP_POLL_EVERY') or 5)   # redundant HTTP fast-lane cadence (WS-down cover)
+HEALTHCHECK_URL = os.environ.get('HEALTHCHECK_URL')            # optional dead-man's-switch (healthchecks.io etc.)
 PENDING_TTL = 900           # keep watching a new pair up to 15 min for liquidity to land
 MAX_PENDING = 600           # cap the watchlist (free-endpoint rate safety)
 
 def _process_funded(token0, token1, pair, liq, base, token):
     """Pair has crossed the liquidity floor -> pull source, run the arsenal, alert on a real class."""
     cn, src = getsrc(token)
-    if not src:
-        return                                        # unverified -> skip (v1; bytecode mode is a later add)
     STATS['funded'] += 1                              # a funded pair we actually fetched + scanned
-    verdict = [x[0] + (':' + x[1] if x[1] else '') for x in run_arsenal(src)]
+    verdict = []
+    if src:                                           # source arsenal (verified tokens)
+        verdict = [x[0] + (':' + x[1] if x[1] else '') for x in run_arsenal(src)]
+        g, why = detect_buy_gate(src)
+        if g:
+            verdict.append('BUY-GATED:' + why[:50])
+    # BYTECODE detector runs on EVERY token incl. UNVERIFIED (src=='' for FCOW/0x8837). This is the fix for the
+    # "unverified -> skip" hole: the fast lane now catches the pair-burn-sync drain class in real time, not just
+    # the poll lane. src is passed so the verified-source FP filter still applies when source IS available.
+    bts = bytecode_burn_sync(token, src)
+    if bts:
+        verdict.append(bts)
     if not verdict:
         return
     classes = {v.split(':')[0] for v in verdict}
@@ -180,13 +198,89 @@ def _repoll_loop():
             if drop:
                 with plock: pending.pop(p, None)
 
+_dispatched = set()
+_dlock = threading.Lock()
 def _dispatch(token0, token1, pair):
+    """IDEMPOTENT dispatch: the WS lane AND the HTTP-poll lane both call this, so a check-and-add under a lock is
+    what stops a pair being processed twice (double alert). `seen` alone wasn't enough — it's set only AFTER
+    processing, leaving an in-flight race between the two lanes."""
+    p = pair.lower()
+    with _dlock:
+        if p in _dispatched:
+            return
+        _dispatched.add(p)
+        if len(_dispatched) > 20000:
+            _dispatched.clear()             # bound memory; `seen` still dedups anything already processed
     threading.Thread(target=handle_pair, args=(token0, token1, pair), daemon=True).start()
+
+def _healthping():
+    """DEAD-MAN'S-SWITCH (fixes 'both jobs crash and you don't notice'): ping an external monitor each poll cycle.
+    If BOTH overlapping listener jobs die, these pings STOP and the monitor (healthchecks.io / any uptime service)
+    alerts YOU -> a total crash becomes VISIBLE instead of a silent coverage hole. Opt-in via HEALTHCHECK_URL."""
+    if not HEALTHCHECK_URL:
+        return
+    try:
+        urllib.request.urlopen(urllib.request.Request(HEALTHCHECK_URL, headers={'User-Agent': 'M'}), timeout=10)
+    except Exception:
+        pass
+
+# getLogs-capable BSC nodes, ROTATED, so the HTTP fallback doesn't itself depend on one flaky endpoint (the whole
+# point of #2). publicnode/dataseed cap getLogs at ~50 blocks; the poller's 10-block range stays under that.
+_POLL_RPCS = [u for u in dict.fromkeys([HTTP, 'https://bsc-rpc.publicnode.com',
+              'https://bsc-dataseed.bnbchain.org', 'https://1rpc.io/bnb']) if u]
+def _rpc_any(method, params):
+    body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params}).encode()
+    for u in _POLL_RPCS:
+        try:
+            r = json.loads(urllib.request.urlopen(urllib.request.Request(
+                u, body, {'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'}), timeout=15).read())
+            if 'result' in r and r['result'] is not None:
+                return r['result']
+        except Exception:
+            continue
+    return None
+
+def _http_poll_loop():
+    """REDUNDANT fast lane (fixes WS flakiness): poll PairCreated/PoolCreated over HTTP every HTTP_POLL_EVERY s,
+    ROTATING getLogs nodes. WS gives ~0.5s but free BSC WSS drops often; this keeps the fast lane alive at ~5s when
+    the WS is down — still HOURS faster than the cron poll. Dedup with the WS path via _dispatch. Filtered to the
+    same V2+V3 factories as the WS sub (spoof-flood safe). Also drives the dead-man's-switch."""
+    last = None
+    while True:
+        try:
+            _healthping()
+            h = _rpc_any('eth_blockNumber', [])
+            head = int(h, 16) if h else None
+            if head:
+                frm = (last + 1) if last else head - 10
+                # CAP the range under publicnode's ~50-block getLogs limit. If the poller ever falls behind (a run
+                # of failures), an uncapped range would exceed 50 -> every getLogs fails -> death spiral. Skipping
+                # ahead drops a few blocks from THIS fast lane, but pairwatch's complete scan covers them.
+                if head - frm > 45:
+                    frm = head - 45
+                if frm <= head:
+                    logs = _rpc_any('eth_getLogs', [{'fromBlock': hex(frm), 'toBlock': hex(head),
+                                                     'address': [FACTORY_V2, FACTORY_V3],
+                                                     'topics': [[PAIRCREATED, POOLCREATED]]}])
+                    if isinstance(logs, list):
+                        for lg in logs:
+                            tps = lg.get('topics', [])
+                            if len(tps) < 3:
+                                continue
+                            t0 = '0x' + tps[1][-40:]; t1 = '0x' + tps[2][-40:]
+                            data = lg.get('data', '')
+                            pool = ('0x' + data[26:66]) if tps[0].lower() == PAIRCREATED else ('0x' + data[90:130])
+                            _dispatch(t0, t1, pool)
+                        last = head             # advance only on a real answer (None -> retry same range)
+        except Exception as e:
+            print('http-poll err', str(e)[:90], flush=True)
+        time.sleep(HTTP_POLL_EVERY)
 
 async def run():
     if websockets is None:
         print('!! pip install websockets'); return
     threading.Thread(target=_repoll_loop, daemon=True).start()   # liquidity-deposit watcher
+    threading.Thread(target=_http_poll_loop, daemon=True).start()  # redundant fast lane (WS-down cover) + dead-man switch
     sub = {'jsonrpc':'2.0','id':1,'method':'eth_subscribe',
            'params':['logs', {'address': [FACTORY_V2, FACTORY_V3],
                               'topics': [[PAIRCREATED, POOLCREATED]]}]}
@@ -196,7 +290,11 @@ async def run():
                 await ws.send(json.dumps(sub))
                 ack = await ws.recv()
                 print('subscribed to V2 PairCreated + V3 PoolCreated:', ack[:120], flush=True)
-                notify('bsc_realtime_listener LIVE — watching PancakeSwap V2+V3 factories (instant on-chain liquidity).')
+                # report the ENDPOINT so uptime is VERIFIABLE: Alchemy = reliable streaming; publicnode = flaky
+                # (means ALCHEMY_KEY secret is unset -> gap-2 coverage is degraded). This is how you confirm the
+                # fast lane is actually receiving on a good pipe, not just "up".
+                endpoint = 'Alchemy (reliable)' if _AK else 'publicnode (FLAKY — set ALCHEMY_KEY secret!)'
+                notify('bsc_realtime_listener LIVE via %s — V2+V3 PairCreated, ~0.5s detection.' % endpoint)
                 async for msg in ws:
                     d = json.loads(msg)
                     log = d.get('params', {}).get('result')
