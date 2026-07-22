@@ -21,14 +21,16 @@ os.makedirs(HOME, exist_ok=True)
 STATE = os.path.join(HOME, "pairwatch_state.json")
 ALERTS = os.path.join(HOME, "pairwatch_alerts.json")
 MIN_LIQ_USD = float(os.environ.get("MIN_LIQ_USD") or 1000)
-MAX_CATCHUP = int(os.environ.get("PW_MAX_CATCHUP") or 200000)
+MAX_CATCHUP = int(os.environ.get("PW_MAX_CATCHUP") or 500000)
 # ^ blocks of backlog one run will accept before JUMPING AHEAD AND PERMANENTLY DROPPING the rest. This is the
 # only place the scanner knowingly loses coverage, so the number has to be honest about BSC's real block rate.
 # WAS 20000, chosen when BSC made a block every ~3s => ~16h of chain (a sane outage cap). BSC now blocks every
 # ~0.45s (~8,000/hour), so 20000 silently became just 2.5 HOURS — shorter than GitHub's own cron throttling
 # (observed 1-3h gaps between */10 runs). Combined with the old CHUNK=50 (which couldn't keep pace), the scanner
-# ran chronically behind, blew this cap routinely, and dropped fresh pairs FOREVER. 200000 = ~25h of chain, and
-# at CHUNK=2000 that is only ~100 getLogs calls (~2-3 min) — affordable, and no gap for any outage under a day.
+# ran chronically behind, blew this cap routinely, and dropped fresh pairs FOREVER. WAS 200000 (~25h): too low
+# once the SECOND bug (unbounded analysis, below) froze last_block — the scanner sat >25h behind and DROPPED every
+# run. 500000 = ~62h of chain; combined with the block-tracked analysis commit below the scanner now self-heals a
+# backlog over a few runs, so this cap only ever fires on a truly catastrophic (>2.5-day) outage.
 CHUNK = 2000        # drpc's getLogs cap. WHY THIS MATTERS: BSC now produces a block every ~0.45s (~8,000/hour),
                     # ~6.7x faster than the ~3s this was designed against. At the old CHUNK=50 (sized for the
                     # WORST node, 1rpc/publicnode) each call covered just 23 SECONDS of chain -> 160 calls/hour,
@@ -38,10 +40,24 @@ CHUNK = 2000        # drpc's getLogs cap. WHY THIS MATTERS: BSC now produces a b
                     # drpc serves 2000 blocks/call (~15 min of chain) = 40x throughput; SUB_CHUNK is the fallback
                     # for the 50-cap nodes so a drpc outage degrades instead of failing.
 SUB_CHUNK = 50                                                 # 1rpc/publicnode getLogs cap (fallback only)
-RUN_BUDGET_S = int(os.environ.get("PW_RUN_BUDGET_S") or 420)   # 7 min of scanning; workflow timeout is 15 min.
-                                                               # The scan is time-boxed and commits partial
-                                                               # progress so a backlog is worked off across runs
-                                                               # instead of timing out and committing NOTHING.
+SCAN_BUDGET_S = int(os.environ.get("PW_SCAN_BUDGET_S") or 300)  # the SCAN (getLogs) gets up to 5 min of the run.
+RUN_BUDGET_S  = int(os.environ.get("PW_RUN_BUDGET_S")  or 1020) # TOTAL run budget (scan + ANALYSIS), 17 min; the
+                                                               # 20-min workflow timeout leaves ~3 min for state
+                                                               # save + notify. Bigger budget = more pairs analyzed
+                                                               # per run = the ~25h backlog clears in fewer runs
+                                                               # (analysis throughput is now the binding constraint).
+                                                               # WHY TWO BUDGETS (the freeze bug):
+                                                               # the old code time-boxed ONLY the scan, then ran an
+                                                               # UNBOUNDED per-pair bytecode analysis (~3s/pair). A
+                                                               # 200k backlog = ~1,500 pairs = >80 min of analysis,
+                                                               # so every run was KILLED by the 15-min timeout BEFORE
+                                                               # the state save (`last_block = ...`) was ever reached
+                                                               # -> last_block froze -> the backlog grew each run and
+                                                               # the DROP alert fired forever. Now the analysis loop
+                                                               # is ALSO deadline-bounded (RUN_BUDGET_S) and commits
+                                                               # last_block at a clean BLOCK boundary of the pairs it
+                                                               # actually finished, so every run saves progress and
+                                                               # the backlog is worked off across runs.
 
 # UniV2-style factories (all share the PairCreated topic + data layout)
 FACTORIES = [
@@ -85,7 +101,16 @@ def _base_price(tok, price, bnb):
     return _LIVE_PX[tok]
 
 # getLogs-capable nodes (50-block chunks); general RPC nodes for getCode/eth_call (no range limit)
-LOG_RPCS = ["https://bsc.drpc.org", "https://1rpc.io/bnb", "https://bsc-rpc.publicnode.com"]  # drpc first: 2000-block range
+# WIDE-RANGE getLogs nodes first, then the 50-cap fallbacks. WHY A POOL, NOT ONE (measured 2026-07-21): the scan
+# needs a 2000-block getLogs; if NO wide node serves it the scan degrades to 50-block sub-chunks (~250 blocks/15s),
+# which can't keep pace with BSC's ~8,000 blocks/h across GitHub's 1-3h cron gaps -> the scanner falls behind. drpc
+# was the ONLY wide node we had and it's FLAKY (observed fully DOWN mid-fix). So we now carry FOUR independent wide
+# providers (each tested 3/3 reliable, serving 2000-50k block ranges): bloXroute, OnFinality, 48.club x2, plus drpc.
+# A single wide node serving = full throughput; all four must fail simultaneously before we ever crawl. nodies
+# (200-block) then the 50-cap nodes are the deep fallbacks. Order = most-reliable-first.
+LOG_RPCS = ["https://bsc.rpc.blxrbdn.com", "https://bnb.api.onfinality.io/public", "https://0.48.club",
+            "https://rpc-bsc.48.club", "https://bsc.drpc.org", "https://bsc-pokt.nodies.app",
+            "https://1rpc.io/bnb", "https://bsc-rpc.publicnode.com"]
 GEN_RPCS = ["https://bsc-rpc.publicnode.com", "https://bsc-dataseed.bnbchain.org",
             "https://bsc-dataseed1.defibit.io", "https://1rpc.io/bnb"]
 if os.environ.get("ALCHEMY_KEY"):
@@ -129,16 +154,17 @@ def _pair_factory(pair):
         return None
 
 def get_paircreated(frm, to, deadline=None):
-    """PairCreated logs across ALL V2 factories in [frm,to] via CHUNK-block getLogs. Returns ([(t0,t1,pair)], scanned).
+    """PairCreated logs across ALL V2 factories in [frm,to] via CHUNK-block getLogs. Returns ([(blk,t0,t1,pair)], scanned).
     GAP-1 FIX: no factory allowlist. We scan EVERY PairCreated event (auto-covers present+future V2 DEXes, not just
     5 hardcoded factories), and validate an UNKNOWN emitter ONCE via pair.factory()==emitter (cached) so spoofed
     events can't DoS us. Known factories are fast-pathed (no validation call).
 
-    `deadline` (unix ts) time-boxes the scan: on hitting it we return the blocks scanned SO FAR, the caller commits
-    that as last_block, and the next run resumes there. This is what stops a big backlog from killing the runner:
-    state is only saved at the END of a run, so a run that exceeds the workflow timeout commits NOTHING, retries the
-    same range, and times out again -> the scanner deadlocks permanently. Measured: a 200k-block backlog is ~1,700
-    pairs = ~57 min of scanning + ~25 min of analysis vs a 15-min timeout. Partial progress beats a dead scanner.
+    `deadline` (unix ts) time-boxes the SCAN: on hitting it we return the blocks scanned SO FAR, the caller commits
+    that as last_block, and the next run resumes there. This alone is NOT enough: state is only saved at the END of
+    a run, and the per-pair ANALYSIS that runs AFTER the scan (~3s/pair) is the real cost — a 200k backlog is ~1,500
+    pairs = >80 min of analysis vs a 15-min timeout, so the run was KILLED before the save and last_block FROZE (the
+    backlog then grew every run and the DROP alert fired forever). The scan deadline here caps the scan; main() caps
+    the analysis with a SECOND deadline and commits at a clean block boundary. Both together = the scanner self-heals.
     """
     out = []
     b = frm
@@ -174,6 +200,14 @@ def get_paircreated(frm, to, deadline=None):
             print(f"  getLogs FAILED at {b}-{e}; committing through {b-1}, re-scan next run", flush=True)
             return out, b - 1               # commit only fully-scanned blocks -> failed range re-scanned next run
         for lg in logs:
+            if deadline and time.time() > deadline:
+                # per-LOG deadline check: the _pair_factory() spoof-validation below is an RPC call, and a spam range
+                # emitting PairCreated from many DISTINCT fake factories could grind this loop past the budget (the
+                # between-chunk checks above wouldn't catch it). Commit through the last FULLY-scanned chunk (b-1);
+                # this chunk re-scans next run and seen-dedup skips anything already analyzed. Now the scan budget
+                # TRULY bounds all scan work, not just the getLogs calls.
+                print(f"  deadline hit mid-chunk log-processing at block {b}; committing through {b-1}", flush=True)
+                return out, b - 1
             tp = lg.get("topics") or []
             data = lg.get("data") or ""
             if len(tp) >= 3 and len(data) >= 66:
@@ -188,7 +222,8 @@ def get_paircreated(frm, to, deadline=None):
                     print(f"  [new factory validated: {emitter}]", flush=True)
                 else:
                     _REJECTED_FACT.add(emitter); continue    # spoofed PairCreated -> reject + cache
-                out.append((t0.lower(), t1.lower(), pair))
+                blk = int(lg.get("blockNumber") or "0x0", 16)   # needed so the ANALYSIS loop can commit progress
+                out.append((blk, t0.lower(), t1.lower(), pair)) # at a clean block boundary (see main())
         b = e + 1
     return out, to
 
@@ -333,8 +368,8 @@ def main():
     if frm > head:                                         # no new blocks (or stale head): skip scan but STILL
         pairs, scanned = [], last                          # re-check pending below (it's TIME-based, not block-based)
     else:
-        pairs, scanned = get_paircreated(frm, head, deadline=_t0 + RUN_BUDGET_S)   # `scanned` may be < head if a
-                                                           # chunk failed OR the run budget expired (both commit
+        pairs, scanned = get_paircreated(frm, head, deadline=_t0 + SCAN_BUDGET_S)  # `scanned` may be < head if a
+                                                           # chunk failed OR the SCAN budget expired (both commit
                                                            # only fully-scanned blocks -> resume, never a gap)
     print(f"scan {frm}..{scanned} -> {len(pairs)} PairCreated", flush=True)
     bnb = _bnb()
@@ -351,8 +386,20 @@ def main():
         notify("BSC pairwatch ALERT (pair-burn-sync)\n%s  liq ~$%d\n%s\nhttps://bscscan.com/token/%s"
                % (flag, round(usd), tok, tok))
 
-    # 1) NEW pairs from this scan
-    for t0, t1, pair in pairs:
+    # 1) NEW pairs from this scan. BUDGET-BOUNDED: the per-pair bytecode analysis is ~3s and a big backlog is
+    # thousands of pairs (>80 min), which used to overrun the workflow timeout and KILL the run before the state
+    # save -> last_block froze forever. We now stop at RUN_BUDGET_S and commit last_block at a CLEAN BLOCK BOUNDARY:
+    # `analyzed_through` = the highest block whose pairs were ALL analyzed. Pairs are sorted by block, so on a
+    # mid-pass stop everything before the current pair's block is done; that block..scanned is re-scanned next run
+    # (cheap — pairs are sparse, and any already-seen token is skipped). Every run now SAVES progress and resumes.
+    pairs.sort(key=lambda r: r[0])
+    analysis_deadline = _t0 + RUN_BUDGET_S
+    analyzed_through = scanned                              # default: finished every pair -> commit the full scan
+    for i, (blk, t0, t1, pair) in enumerate(pairs):
+        if time.time() > analysis_deadline:
+            analyzed_through = blk - 1                      # blk..scanned not fully analyzed -> re-scan next run
+            print(f"  analysis budget hit at pair {i}/{len(pairs)} (block {blk}); committing through {blk-1}", flush=True)
+            break
         token = pick_token(t0, t1)
         if not token or token in seen_set or token in pending:
             continue
@@ -369,7 +416,12 @@ def main():
                 pending[token] = [pair, flag, time.time()] # burn-sync but UNFUNDED -> re-check (create-then-fund)
 
     # 2) RE-CHECK pending: flag "?" = code was unreadable (re-run detector); a real flag = unfunded (re-check liq).
+    # Also budget-bounded: pending can hold many burn-sync-but-unfunded tokens and each re-check is an RPC round;
+    # left unbounded it could re-open the timeout hole. Anything not reached stays pending (TTL governs expiry).
     for token in list(pending.keys()):
+        if time.time() > analysis_deadline:
+            print(f"  analysis budget hit during pending re-check; {len(pending)} left for next run", flush=True)
+            break
         pair, flag, ts = pending[token]
         if time.time() - ts > PENDING_TTL:
             del pending[token]; _mark(token); continue
@@ -384,7 +436,11 @@ def main():
         if usd >= MIN_LIQ_USD:
             _fire(token, pair, flag, usd); del pending[token]; _mark(token)
 
-    st["last_block"] = scanned                             # commit ONLY fully-scanned blocks; a failed chunk re-scans next run
+    # commit only blocks whose pairs were fully ANALYZED (<= scanned); a failed chunk OR a budget-truncated analysis
+    # re-scans next run. INVARIANT: last_block is MONOTONIC — never below where this run started (`last`). Correct
+    # operation always gives analyzed_through in [last, scanned]; the max() is a guard so a single malformed
+    # blockNumber from some future RPC can never rewind last_block and trigger a catastrophic re-scan from genesis.
+    st["last_block"] = max(analyzed_through, last)
     st["seen"] = seen[-20000:]                             # ordered -> keeps the most recent
     st["pending"] = pending
     json.dump(st, open(STATE, "w"))
