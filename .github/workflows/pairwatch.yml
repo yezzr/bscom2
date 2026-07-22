@@ -19,7 +19,8 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20      # matches PW_RUN_BUDGET_S=1020s (17 min scan+analysis) + ~3 min for state save/notify.
+                             # The run budget self-limits well under this; the timeout is only a hard backstop.
     steps:
       - uses: actions/checkout@v4
 
@@ -42,6 +43,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ALCHEMY_KEY: ${{ secrets.ALCHEMY_KEY }}   # optional; falls back to public nodes if unset
+          ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}   # optional; enables the verified-source FP filter (kills legit sync-caller FPs)
           MIN_LIQ_USD: '1000'
           # manual "Run workflow" -> true -> sends a self-test ping proving the pipeline reaches your phone
           SELFTEST: ${{ github.event_name == 'workflow_dispatch' }}
