@@ -11,7 +11,7 @@ HTTP calls per pass). Single-pass by default (cron/Action) or --loop for a daemo
 bsc_forward_state.json. Live alerts via env: TELEGRAM_BOT_TOKEN+TELEGRAM_CHAT_ID / DISCORD_WEBHOOK /
 NTFY_TOPIC. Needs ETHERSCAN_API_KEY (source fetch); no BSC RPC required.
 """
-import json, os, sys, time, urllib.request, urllib.parse
+import json, os, re, sys, time, urllib.request, urllib.parse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # CWD-independent (cron/Action safe)
 from arsenal_scan import getsrc, run_arsenal
 try:
@@ -209,6 +209,59 @@ def _burn_from_pair(src):
     return any(k in low for k in ('_burn(pair', '_burn(uniswap', '_burn(pancake', '_burn(targetpool', '_burn(_pair',
                                   '_burn(lppair', '_burn(pool', 'balances[pair]-=', '_balances[pair]-=', 'balanceof[pair]'))
 
+# --- VERIFIED-only downgrade: the benign DEFLATION family (RWX/TKN/BNC) vs a real permissionless DRAIN ----------
+# Fork-proven across 5 live tokens (2026-07): every SYNC/SKIM+BURN / SRC-BURN-FROM-PAIR alert was NOT a
+# permissionless LP drain. The discriminator that settled each is "does msg.sender end up richer?" (needs a fork).
+# Its cheap STATIC proxy for the benign daily-deflation family: the burn-from-pair is RATE-LIMITED to once per day
+# AND sends tokens to a DEAD/zero address (or reduces supply), never crediting the caller. A capped daily burn is
+# provably swamped by the swap tax (buy->burn->sell = a LOSS, fork-confirmed on RWX/TKN/BNC), so it is not a
+# profitable drain. CONSERVATIVE BY DESIGN (all in _deflation_family below): requires ALL of (1) the token actually
+# REDUCES the pair balance, (2) a once-per-day gate, (3) a dead/zero destination, AND bails on ANY caller-payout
+# shape (direct balance credit, swap-to-caller, or transfer-to-caller). Only runs on VERIFIED source. A real
+# burn-sync drain (FCOW/AIDC/JL) is unbounded/repeatable and/or unverified -> never matches -> stays HIGH. A
+# honeypot whose burn isn't daily-gated (XINGHUO) -> stays HIGH. A verified token with only COINCIDENTAL daily/dead
+# strings but whose drain pays the caller (via balance-credit OR swap) -> caught by the payout bail + pair-reduce
+# requirement -> stays HIGH. The fork step still backstops everything downgraded, so a wrong downgrade is a digest
+# entry, never a silent drop.
+_DAILY_GATE = ('roundcutted', 'dayexecuted', 'lastburnday', 'dayindex', 'getday(', 'daycutted', 'burnedtoday',
+               'lastburntime', 'roundcut')
+_DEAD_DEST  = ('address(0xdead)', '0x000000000000000000000000000000000000dead', '_balances[address(0)]',
+               '_burn(address(this)', '_burn(uniswap', '_burn(pancake', '_burn(pool', 'deadaddress', 'burn_address')
+# (regexes run on lowercased, whitespace-stripped source)
+# the deflation MECHANISM must actually touch the LP PAIR's own balance. Broadened past _burn_from_pair to catch
+# the `.sub()` style RWX uses (`_balances[pancakePair].sub(`) and TKN's `super._transfer(wttLpPair,...)`. REQUIRED
+# for a downgrade so coincidental daily/dead strings elsewhere can't digest a token whose drain never touches the pair.
+_PAIR_SUB_RE  = re.compile(r'_balances\[\w*pair\w*\](\.sub\(|-=)')
+_PAIR_XFER_RE = re.compile(r'super\._transfer\(\w*pair\w*,')
+# caller-PAYOUT tells (real caller-profit-drain shapes): a direct balance credit, OR a swap / token-transfer whose
+# recipient is the caller. Any of these BAILS the downgrade -> the token stays HIGH. (`_transfer(msg.sender,...)` is
+# NOT matched — that leading-underscore internal call is the standard send-FROM-caller, present in every ERC20.)
+_SWAP_CALLER_RE = re.compile(r'\.swap\([^;{}]*,(msg\.sender|_msgsender\(\)),')
+_XFER_CALLER_RE = re.compile(r'\.transfer\((msg\.sender|_msgsender\(\)),')
+
+def _reduces_pair_balance(low):
+    """Does the token actually reduce the LP pair's own token balance (the deflation/burn-from-pair mechanism)?"""
+    return (bool(_PAIR_SUB_RE.search(low)) or bool(_PAIR_XFER_RE.search(low))
+            or any(k in low for k in ('_burn(pair', '_burn(uniswap', '_burn(pancake', '_burn(pool', '_burn(lppair',
+                                      '_burn(_pair', '_balances[pair]-=', 'balances[pair]-=')))
+
+def _deflation_family(src):
+    """True => VERIFIED and this is a benign once-per-day, burn-to-dead DEFLATION tokenomic -> DIGEST, not a HIGH
+    ping. Requires ALL of: (1) the token actually REDUCES the LP pair's balance (the deflation mechanism); (2) a
+    once-per-day rate-limit gate; (3) a DEAD/zero burn destination; AND bails if the burn path PAYS the caller
+    (direct balance credit, OR a swap/transfer to msg.sender = the real caller-profit-drain shape). Each condition
+    narrows toward 'provably not a profitable drain'; unverified tokens and real drains never satisfy all four. The
+    fork step still backstops anything downgraded, so a wrong downgrade is a digest entry, never a silent drop."""
+    if not src:
+        return False
+    low = src.lower().replace(' ', '').replace('\n', '').replace('\r', '')
+    daily        = any(g in low for g in _DAILY_GATE)
+    dead         = any(d in low for d in _DEAD_DEST)
+    reduces_pair = _reduces_pair_balance(low)
+    credits_caller = ('_balances[msg.sender]+' in low or '_balances[_msgsender()]+' in low
+                      or bool(_SWAP_CALLER_RE.search(low)) or bool(_XFER_CALLER_RE.search(low)))
+    return daily and dead and reduces_pair and not credits_caller
+
 def bytecode_burn_sync(token, src=None):
     """Pair-burn-sync tell on BYTECODE (unverified-safe). sync/skim + a burn selector -> HIGH. sync/skim WITHOUT a
     known burn selector could be a hidden-burn drain (PHX) OR a LEGIT sync-caller (e.g. a rebase/LP token). When
@@ -227,9 +280,13 @@ def bytecode_burn_sync(token, src=None):
     if not any(s in code for s in _MANIP_SELS):         # no sync()/skim() reference -> not this class
         return None
     if any(s in code for s in _BURN_SELS):
+        if _deflation_family(src):                       # VERIFIED once-per-day burn-to-dead -> not a drain -> digest
+            return 'PAIR-BURN-SYNC:DEFLATION-FAMILY(DIGEST)'
         return 'PAIR-BURN-SYNC:SYNC/SKIM+BURN(HIGH)'
     if src:                                              # verified source available -> trust it to disambiguate
-        return 'PAIR-BURN-SYNC:SRC-BURN-FROM-PAIR(HIGH)' if _burn_from_pair(src) else None
+        if not _burn_from_pair(src):
+            return None
+        return 'PAIR-BURN-SYNC:DEFLATION-FAMILY(DIGEST)' if _deflation_family(src) else 'PAIR-BURN-SYNC:SRC-BURN-FROM-PAIR(HIGH)'
     return 'PAIR-BURN-SYNC:UNVERIFIED-SYNC/SKIM(HIGH)'   # unverified -> keep HIGH (hidden-burn class)
 
 def gt_pools():
