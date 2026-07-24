@@ -23,6 +23,14 @@ pw._bnb = lambda: 600.0
 _sent = []
 pw.notify = lambda m: _sent.append(m)
 
+# These fault tests exercise DETECTION/COVERAGE (getcode resolution, create-then-fund, budget-truncation resume),
+# not the honeypot-sim alert routing (covered by test_honeypot_sim_routing.py). Stub the sim to always look
+# naive-PROFITABLE so a detected+funded burn-sync token INSTANT-pings, keeping these assertions about coverage.
+class _AlwaysProfit:
+    def simulate(self, *a, **k):
+        return {"tag": "ROUNDTRIP-OK", "profitable": True, "note": "test-stub"}
+pw.honeypot_sim = _AlwaysProfit()
+
 def load_state():
     return json.load(open(pw.STATE)) if os.path.exists(pw.STATE) else {}
 

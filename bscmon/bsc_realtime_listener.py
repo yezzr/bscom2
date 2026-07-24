@@ -43,6 +43,12 @@ except Exception:
         return False
     def detect_buy_gate(s): return (False, '')
     def bytecode_burn_sync(token, src=None): return None
+def _burnsync_high(verdict):
+    return any(v.split(':')[0] == 'PAIR-BURN-SYNC' and 'HIGH' in v for v in verdict)
+try:
+    import honeypot_sim                       # forge-accurate round-trip sim (calibrates burn-sync HIGH -> ping vs digest)
+except Exception:
+    honeypot_sim = None
 
 # Endpoints: prefer Alchemy (reliable log streaming) when ALCHEMY_KEY is set as a SECRET (safe on a public
 # repo — it's not in code); fall back to keyless publicnode. publicnode's free pool is flaky for log subs.
@@ -138,6 +144,16 @@ def _process_funded(token0, token1, pair, liq, base, token):
     classes = {v.split(':')[0] for v in verdict}
     precise = is_pushworthy(verdict)                  # precise classes: ping instantly
     ping, tag = precise, 'PRECISE'
+    # A PAIR-BURN-SYNC HIGH is calibrated by the forge-accurate round-trip sim. A gated honeypot and a real gated
+    # drain look IDENTICAL here, so a non-profitable result does NOT clear it — it just DEMOTES from an instant ping
+    # to the poll-lane's daily digest (pairwatch scans the same pairs). Only a rare naive-PROFITABLE round-trip pings.
+    if ping and _burnsync_high(verdict) and honeypot_sim:
+        sim = honeypot_sim.simulate(token, pair)
+        verdict.append('sim:' + sim.get('tag', '?'))
+        # demote to the poll-lane digest ONLY when the sim actually RAN and was non-profitable; an unsimmable base
+        # or an RPC failure (evaluated=False) keeps the loud ping — never suppress a HIGH we couldn't check.
+        if sim.get('evaluated') and not sim.get('profitable'):
+            ping, tag = False, 'SUSPECT (burn-sync honeypot-shaped; see daily digest)'
     if not precise and 'FORCE-DUMP' in classes and CONFIRM:   # FP-heavy: fork-sim CONFIRM before ping
         if fork_confirm(token, pair, liq):
             ping, tag = True, 'FORK-CONFIRMED-EXPLOITABLE'

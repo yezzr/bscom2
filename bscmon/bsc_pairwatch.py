@@ -15,6 +15,10 @@ try:
     PAIRCREATED = "0x" + keccak(text="PairCreated(address,address,address,uint256)").hex()
 except Exception:
     PAIRCREATED = "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"
+try:
+    import honeypot_sim                       # forge-accurate buy->sell round-trip via eth_call state-override
+except Exception:                             # missing module must never break a scan pass
+    honeypot_sim = None
 
 HOME = os.environ.get("PW_HOME") or os.path.dirname(os.path.abspath(__file__))
 os.makedirs(HOME, exist_ok=True)
@@ -348,6 +352,8 @@ def main():
     alerts = json.load(open(ALERTS)) if os.path.exists(ALERTS) else []
     seen = st.get("seen", [])                              # ordered list (newest last) so pruning keeps recent
     seen_set = set(seen)
+    suspects = st.get("suspects", []) if isinstance(st.get("suspects"), list) else []   # burn-sync HIGH but not
+    hb_date = st.get("hb_date", "")                        # naive-profitable -> batched into the once-daily digest
     pending = st.get("pending", {})                        # token -> [pair, flag, first_ts]: burn-sync but not yet
     PENDING_TTL = 6 * 3600                                 # funded -> re-checked EVERY run (the create-then-fund fix)
     head = head_block()
@@ -379,12 +385,27 @@ def main():
         seen_set.add(tok); seen.append(tok)
     def _fire(tok, pair, flag, usd):
         nonlocal fired
-        fired += 1
-        rec = {"token": tok, "pair": pair, "flag": flag, "liq_usd": round(usd), "t": time.strftime("%Y-%m-%d %H:%M")}
-        alerts.append(rec)
-        print("*** ALERT", rec, flush=True)
-        notify("BSC pairwatch ALERT (pair-burn-sync)\n%s  liq ~$%d\n%s\nhttps://bscscan.com/token/%s"
-               % (flag, round(usd), tok, tok))
+        # CALIBRATE the alert with a forge-accurate buy->sell round-trip sim (eth_call state-override). Fork-proven
+        # 2026-07-24: a gated HONEYPOT (PEPGEM) and a REAL gated DRAIN (FCOW $61k / AIDC $120k) return the IDENTICAL
+        # reverting sim signature, so a non-profitable result CANNOT clear a HIGH. Only a naive-PROFITABLE round-trip
+        # (rare) is a strong act-now signal -> instant ping. Everything else is a SUSPECT: never dropped, batched to
+        # the once-daily digest with its sim tag (this is what cut the phone-ping false-hope floods).
+        sim = honeypot_sim.simulate(tok, pair) if honeypot_sim else {"tag": "NO-SIM", "profitable": False, "evaluated": False, "note": "sim module unavailable"}
+        rec = {"token": tok, "pair": pair, "flag": flag, "liq_usd": round(usd),
+               "sim": sim.get("tag"), "note": sim.get("note"), "t": time.strftime("%Y-%m-%d %H:%M")}
+        # DEMOTE to the daily digest ONLY when the sim actually RAN and showed non-profitable. If it was profitable,
+        # or could NOT be evaluated (unsimmable base / RPC failure / module missing), keep the LOUD instant ping —
+        # never suppress a HIGH we couldn't actually check (the getcode-fail discipline).
+        if not sim.get("evaluated") or sim.get("profitable"):
+            fired += 1
+            alerts.append(rec)
+            kind = "⚡ NAIVE-PROFITABLE (rare - act)" if sim.get("profitable") else "HIGH (sim n/a - unverified, kept loud)"
+            print("*** ALERT", kind, rec, flush=True)
+            notify("BSC pairwatch %s\n%s  liq ~$%d\nsim: %s (%s)\n%s\nhttps://bscscan.com/token/%s"
+                   % (kind, flag, round(usd), sim.get("tag"), sim.get("note"), tok, tok))
+        else:
+            suspects.append(rec)                       # evaluated + non-profitable -> once-daily digest, not a ping
+            print("*** SUSPECT->digest", rec, flush=True)
 
     # 1) NEW pairs from this scan. BUDGET-BOUNDED: the per-pair bytecode analysis is ~3s and a big backlog is
     # thousands of pairs (>80 min), which used to overrun the workflow timeout and KILL the run before the state
@@ -440,12 +461,35 @@ def main():
     # re-scans next run. INVARIANT: last_block is MONOTONIC — never below where this run started (`last`). Correct
     # operation always gives analyzed_through in [last, scanned]; the max() is a guard so a single malformed
     # blockNumber from some future RPC can never rewind last_block and trigger a catastrophic re-scan from genesis.
+    # DAILY DIGEST of burn-sync SUSPECTS (honeypot-shaped / tradeable-lossy / unsimmable — the class that used to
+    # false-ping the phone). Fires once per calendar day so a real gated drain (which looks identical to a honeypot
+    # here) still surfaces same-day within its window, without an instant buzz per honeypot. Instant pings are now
+    # reserved for naive-PROFITABLE sims (see _fire). Silent when there are no suspects (forward_monitor's heartbeat
+    # already proves liveness).
+    today = time.strftime("%Y-%m-%d")
+    if not hb_date:
+        hb_date = today                                    # first run ever: seed, accumulate a full day before day-1 digest
+    elif today != hb_date:
+        if suspects:
+            top = sorted(suspects, key=lambda r: -r.get("liq_usd", 0))[:12]
+            lines = ["BSC pairwatch — daily burn-sync digest",
+                     "%d suspect(s) since last digest. These are NOT confirmed: a real gated drain is cheaply"
+                     " indistinguishable from a honeypot, so verify by replay before acting." % len(suspects)]
+            for r in top:
+                lines.append("· %s $%d [%s | %s] bscscan.com/token/%s"
+                             % (r.get("flag", "?"), r.get("liq_usd", 0), r.get("sim", "?"), (r.get("note") or "")[:60], r["token"]))
+            notify("\n".join(lines))
+            suspects = []
+        hb_date = today                                    # advance the date (quiet day sends nothing)
     st["last_block"] = max(analyzed_through, last)
     st["seen"] = seen[-20000:]                             # ordered -> keeps the most recent
     st["pending"] = pending
+    st["suspects"] = suspects[-500:]                       # bound state growth
+    st["hb_date"] = hb_date
     json.dump(st, open(STATE, "w"))
     json.dump(alerts, open(ALERTS, "w"), indent=1)
-    print(f"done: scanned {scanned}/{head}, {len(pairs)} pairs, {len(pending)} pending, {fired} alert(s)", flush=True)
+    print(f"done: scanned {scanned}/{head}, {len(pairs)} pairs, {len(pending)} pending, "
+          f"{fired} profitable-ping(s), {len(suspects)} suspect(s) pending digest", flush=True)
     if os.environ.get("SELFTEST", "").strip().lower() in ("1", "true", "yes"):
         notify("BSC pairwatch SELF-TEST - catch-up scanner alive on GitHub Actions.")
 

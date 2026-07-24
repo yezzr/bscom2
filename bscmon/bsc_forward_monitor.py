@@ -58,6 +58,11 @@ CLEARED_SEED = {
     '0x35a581894377eaddd568aab6148a7df462044444',  # PRISONP
 }
 
+try:
+    import honeypot_sim                       # forge-accurate buy->sell round-trip via eth_call state-override
+except Exception:                             # a missing module must never break a monitor pass
+    honeypot_sim = None
+
 def is_pushworthy(verdict):
     """Only PUSH the precise/validated classes — the noisy ones (FORCE-DUMP, DRAIN, BUY-GATED-alone,
     PAIR-BURN-SYNC MEDIUM/LOW) are tracked in state but NOT pinged, to keep phone alerts high-signal.
@@ -70,6 +75,24 @@ def is_pushworthy(verdict):
         if cls == 'PAIR-BURN-SYNC' and 'HIGH' in v:
             return True
     return False
+
+def _burnsync_high(verdict):
+    return any(v.split(':')[0] == 'PAIR-BURN-SYNC' and 'HIGH' in v for v in verdict)
+
+def _sim_gate(token, pool, verdict):
+    """Calibrate a PAIR-BURN-SYNC HIGH with the forge-accurate round-trip sim. Returns (instant_push, sim_note).
+    A gated HONEYPOT and a real gated DRAIN look IDENTICAL to this sim (both revert), so a non-profitable result
+    does NOT clear the HIGH — it just DEMOTES it from an instant phone ping to the daily REVIEW digest (still
+    tracked, never dropped). Only a rare naive-PROFITABLE round-trip stays an instant ping. Non-burn-sync push
+    classes (PARKED-MINT etc.) are unaffected."""
+    if not _burnsync_high(verdict) or not honeypot_sim or not pool:
+        return (is_pushworthy(verdict), '')
+    sim = honeypot_sim.simulate(token, pool)
+    note = ' | sim:%s (%s)' % (sim.get('tag', '?'), sim.get('note', ''))
+    # keep the instant ping if PROFITABLE or if the sim could NOT be evaluated (unsimmable base / RPC fail): never
+    # demote a HIGH we couldn't actually check. Only an evaluated, non-profitable sim demotes it to the review digest.
+    keep_loud = bool(sim.get('profitable')) or not sim.get('evaluated')
+    return (keep_loud, note)
 
 def notify(text):
     """Push a LIVE alert to whichever channels are configured via env vars (all optional).
@@ -481,16 +504,19 @@ def one_pass():
                               ' '.join(v2) or 'clean', token))
         if token.lower() in cleared:
             continue                                            # fork-confirmed clean — never alert or review again
-        if is_pushworthy(info.get('verdict', [])) and not info.get('alerted') and liq >= MIN_LIQ_USD:
+        # A PAIR-BURN-SYNC HIGH only instant-pings if the round-trip sim shows a naive PROFIT; otherwise it is
+        # SUSPECT (honeypot OR a gated drain that looks identical) -> demoted to the REVIEW digest below, not dropped.
+        _push, _simnote = _sim_gate(token, pool, info.get('verdict', []))
+        if _push and not info.get('alerted') and liq >= MIN_LIQ_USD:
             info['alerted'] = True
             fired += 1
             rec = {'token': token, 'name': info.get('name'), 'pool': pool, 'liq_usd': round(liq),
                    'verdict': info['verdict'], 'note': 'HIGH-CONFIDENCE risky + funded',
                    'ts': time.strftime('%Y-%m-%d %H:%M')}
             alerts.append(rec)
-            print('*** ALERT %s (%s) $%d %s' % (token, info.get('name'), liq, info['verdict']), flush=True)
-            notify('BSC fresh-deploy ALERT\n%s — %s\nliq ~$%d\n%s\ntoken: %s\nhttps://bscscan.com/token/%s'
-                   % (info.get('name') or '?', rec['note'], liq, ' '.join(info['verdict']), token, token))
+            print('*** ALERT %s (%s) $%d %s%s' % (token, info.get('name'), liq, info['verdict'], _simnote), flush=True)
+            notify('BSC fresh-deploy ALERT\n%s — %s\nliq ~$%d\n%s%s\ntoken: %s\nhttps://bscscan.com/token/%s'
+                   % (info.get('name') or '?', rec['note'], liq, ' '.join(info['verdict']), _simnote, token, token))
         elif (liq >= MIN_LIQ_USD and not info.get('alerted')
               and token.lower() not in reviewed         # never re-surface a token shown in a prior digest
               and token not in {r['token'] for r in review_today}):
