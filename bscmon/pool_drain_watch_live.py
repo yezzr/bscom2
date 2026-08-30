@@ -26,7 +26,13 @@ import os, sys, json, time, urllib.request, urllib.parse
 DUNE_KEY = os.environ.get("DUNE_API_KEY")
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TG_CHAT  = os.environ.get("TELEGRAM_CHAT_ID")
-ARCHIVE  = os.environ.get("ARCHIVE_RPC_URL")   # REQUIRED: an ARCHIVE BSC node (public nodes prune)
+ARCHIVE  = os.environ.get("ARCHIVE_RPC_URL")   # OPTIONAL now: your own/paid archive node, tried FIRST if set
+# FREE public BSC ARCHIVE nodes (verified 2026-08-30: both return correct historical state -- FH pre-drain
+# balance read as $20k/$0 across the drain block). Used as fallback so the detector works with NO secret.
+# (Full/dataseed nodes prune state after ~128 blocks and can't serve these; these two are true archives.)
+FREE_ARCHIVES = ["https://bsc-mainnet.public.blastapi.io",
+                 "https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3"]
+ARCHIVES = ([ARCHIVE] if ARCHIVE else []) + FREE_ARCHIVES   # your node first (if set), then free fallbacks
 QID      = int(os.environ.get("DUNE_QUERY_ID", "7798810"))
 MIN_USD  = int(os.environ.get("DRAIN_MIN_USD", "50000"))
 HOURS    = int(os.environ.get("DRAIN_LOOKBACK_HOURS", "24"))
@@ -130,15 +136,16 @@ def token_sym(addr):
     except Exception: return addr[:10]
 
 def archive(method, params):
-    """archive-node-only call (before-block state); public nodes prune and would silently lie."""
-    if not ARCHIVE: return None
+    """archive-node call (before-block state); rotates ARCHIVES (your node first, then free fallbacks) until
+       one answers. Pruning full nodes are NOT in this list -- every endpoint here serves historical state."""
     b = json.dumps({"jsonrpc":"2.0","id":1,"method":method,"params":params}).encode()
-    for _ in range(5):
-        try:
-            r = json.loads(urllib.request.urlopen(urllib.request.Request(
-                ARCHIVE, b, {"Content-Type":"application/json","User-Agent":"M"}), timeout=15).read())
-            if r.get("result") is not None: return r["result"]
-        except Exception: continue
+    for url in ARCHIVES:
+        for _ in range(2):
+            try:
+                r = json.loads(urllib.request.urlopen(urllib.request.Request(
+                    url, b, {"Content-Type":"application/json","User-Agent":"Mozilla/5.0"}), timeout=15).read())
+                if r.get("result") is not None: return r["result"]
+            except Exception: continue
     return None
 
 def confirm(tx, pair, base_tok):
@@ -183,7 +190,7 @@ def validate():
        Proves the WHOLE live pipeline without any perishable hardcoded tx: (1) SQL returns drains,
        (2) confirm() accepts a REAL one live (archive path works), (3) the gate rejects a flow-through shape."""
     print("VALIDATE (self-refreshing): SQL returns drains + confirm() confirms a real one live + gate rejects flow-through.")
-    if not ARCHIVE: die("VALIDATE needs ARCHIVE_RPC_URL (archive node) for the confirm step.")
+    print("  archive endpoints: %d (%s)" % (len(ARCHIVES), "your node + free fallbacks" if ARCHIVE else "free fallbacks only"))
     rows = run_query("block_time > now() - interval '7' day")
     if not rows: die("FAIL: SQL returned 0 candidates over 7d -- query or thresholds broken.")
     print("  [1/3] SQL ok: %d candidates over 7d (biggest loss $%d)" % (len(rows), int(-min(r["net_usd"] for r in rows))))
@@ -210,8 +217,8 @@ def validate():
 
 def main():
     if "--validate" in sys.argv: validate()
-    if not ARCHIVE: die("FATAL: set ARCHIVE_RPC_URL to an archive BSC node -- the confirm step needs it, "
-                        "and without it we'd alert flash-swap flow-through as fake drains.")
+    # archive is no longer a hard requirement: ARCHIVES always has free fallbacks. If EVERY archive is down,
+    # confirm() returns UNCHECKABLE and the BLIND GUARD below pages + fails loudly -- never a silent flow-through alert.
     rows = run_query(f"block_time > now() - interval '{HOURS}' hour")
     ledger = set(json.load(open(LEDGER))) if os.path.exists(LEDGER) else set()
     cand = [r for r in rows if r["tx_hash"] not in ledger]
