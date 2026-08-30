@@ -32,7 +32,9 @@ jobs:
           ARCHIVE_RPC_URL:    ${{ secrets.ARCHIVE_RPC_URL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          DRAIN_MIN_USD:      "50000"
+          DRAIN_MIN_USD:      "15000"  # was 50000 -> that floor missed FH ($20k). $15k catches the FH/CCC/Fox class.
+          DRAIN_MIN_POOL_USD: "15000"  # was 50000 -> FH's pool was only ~$20-40k; a $50k pool-floor rejected it outright
+          DRAIN_MIN_FRACTION: "0.35"   # was 0.5 -> catch partial drains too; flash-swap flow-through still has frac~=0 -> rejected
           DRAIN_LOOKBACK_HOURS: "2"    # window > cron interval, so nothing slips between runs
         run: python bscmon/pool_drain_watch_live.py
 
