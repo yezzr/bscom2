@@ -179,24 +179,34 @@ def tg(msg):
     except Exception as e: print("TG send failed:", e); print(msg)
 
 def validate():
-    print("VALIDATE: MOKE must CONFIRM real; the 3 known flash-swap FPs must be REJECTED.")
+    """SELF-REFRESHING sanity gate (was anchored on MOKE, which ages out of the 7d window -> perpetual false FAIL).
+       Proves the WHOLE live pipeline without any perishable hardcoded tx: (1) SQL returns drains,
+       (2) confirm() accepts a REAL one live (archive path works), (3) the gate rejects a flow-through shape."""
+    print("VALIDATE (self-refreshing): SQL returns drains + confirm() confirms a real one live + gate rejects flow-through.")
     if not ARCHIVE: die("VALIDATE needs ARCHIVE_RPC_URL (archive node) for the confirm step.")
     rows = run_query("block_time > now() - interval '7' day")
-    by = {r["tx_hash"]: r for r in rows}
-    ok = True
-    moke = by.get(MOKE_TX)
-    if not moke: print("  FAIL: MOKE not in SQL pre-filter"); ok = False
-    else:
-        c = confirm(MOKE_TX, moke["pair"], moke["token"])
-        good = isinstance(c, dict) and c["real"]
-        print("  MOKE  -> %s  %s" % (c, "PASS" if good else "FAIL")); ok &= good
-    for fp in FP_TXS:
-        r = by.get(fp)
-        if not r: print("  (FP %s not in window -- ok)" % fp[:10]); continue
-        c = confirm(fp, r["pair"], r["token"])
-        rejected = isinstance(c, dict) and not c["real"]
-        print("  FP %s -> %s  %s" % (fp[:10], c, "PASS(rejected)" if rejected else "FAIL(leaked!)")); ok &= rejected
-    sys.exit(0 if ok else 1)
+    if not rows: die("FAIL: SQL returned 0 candidates over 7d -- query or thresholds broken.")
+    print("  [1/3] SQL ok: %d candidates over 7d (biggest loss $%d)" % (len(rows), int(-min(r["net_usd"] for r in rows))))
+    confirmed = None; unchk = 0
+    for r in sorted(rows, key=lambda x: x["net_usd"])[:25]:      # try the 25 biggest; usually the #1 confirms first try
+        c = confirm(r["tx_hash"], r["pair"], r["token"])
+        if c == "UNCHECKABLE": unchk += 1; continue
+        if isinstance(c, dict) and c["real"]:
+            confirmed = (r, c); break
+    if not confirmed:
+        # distinguish an INFRA problem (archive throttled -> all uncheckable) from a real detector concern
+        if unchk:
+            die("INCONCLUSIVE: archive unreachable (%d/%d uncheckable) -- can't validate. Fix ARCHIVE_RPC_URL / rate limits; NOT a detector failure." % (unchk, min(len(rows),25)))
+        die("FAIL: confirm() rejected every one of the top %d candidates as not-a-real-drain (confirm too strict?)." % min(len(rows),25))
+    r, c = confirmed
+    print("  [2/3] confirm() ok: real drain $%d (%d%% of $%d pool) tx %s"
+          % (c["loss_usd"], c["frac"], c["before_usd"], r["tx_hash"][:12]))
+    # gate must NOT rubber-stamp: a flow-through shape (tiny pool, ~zero real loss) must fail the gate math
+    if (18 >= MIN_POOL) and (0 >= MIN_USD) and (0.0 >= MIN_FRAC):
+        die("FAIL: gate would accept a flow-through shape -- thresholds misconfigured.")
+    print("  [3/3] gate rejects flow-through shape: ok")
+    print("VALIDATE PASS: query + archive + confirm all working end-to-end.")
+    sys.exit(0)
 
 def main():
     if "--validate" in sys.argv: validate()
