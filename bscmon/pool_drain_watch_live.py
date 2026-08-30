@@ -33,7 +33,7 @@ ARCHIVE  = os.environ.get("ARCHIVE_RPC_URL")   # OPTIONAL now: your own/paid arc
 FREE_ARCHIVES = ["https://bsc-mainnet.public.blastapi.io",
                  "https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3"]
 ARCHIVES = ([ARCHIVE] if ARCHIVE else []) + FREE_ARCHIVES   # your node first (if set), then free fallbacks
-QID      = int(os.environ.get("DUNE_QUERY_ID", "7798810"))
+QID      = int(os.environ.get("DUNE_QUERY_ID") or "7798810")   # `or` so an EMPTY secret doesn't crash int("")
 MIN_USD  = int(os.environ.get("DRAIN_MIN_USD", "50000"))
 HOURS    = int(os.environ.get("DRAIN_LOOKBACK_HOURS", "24"))
 MIN_POOL = int(os.environ.get("DRAIN_MIN_POOL_USD", "50000"))  # ignore trivial-reserve conduits
@@ -110,7 +110,14 @@ def api(method, url, body=None):
     except urllib.error.HTTPError as e: return {"_err": e.code, "_body": e.read().decode()[:300]}
 
 def run_query(window_clause):
-    api("PATCH", f"https://api.dune.com/api/v1/query/{QID}", {"query_sql": build_sql(window_clause)})
+    # PATCH the query with our SQL. THIS MUST SUCCEED -- if the key doesn't OWN query QID, Dune silently keeps the
+    # old saved SQL and re-runs THAT (the "1 stale candidate" bug). Check the response and fail loudly instead.
+    patch = api("PATCH", f"https://api.dune.com/api/v1/query/{QID}", {"query_sql": build_sql(window_clause)})
+    if isinstance(patch, dict) and patch.get("_err"):
+        die("FATAL: cannot update Dune query %d (HTTP %s) -- your DUNE_API_KEY does NOT OWN it, so the scanner "
+            "would run a STALE query. FIX: create your own query at dune.com/queries (any empty SQL), open it, copy "
+            "the number from its URL (dune.com/queries/<NUMBER>), and set it as the DUNE_QUERY_ID secret. body=%s"
+            % (QID, patch["_err"], patch.get("_body", "")))
     eid = api("POST", f"https://api.dune.com/api/v1/query/{QID}/execute", {}).get("execution_id")
     if not eid: die("Dune execute failed (check DUNE_API_KEY / query perms).")
     for _ in range(120):
