@@ -383,6 +383,20 @@ def main():
 
     def _mark(tok):
         seen_set.add(tok); seen.append(tok)
+    _seeded = set()
+    def _seed_watch(tok, pair, flag):
+        # Hand every confirmed sync/skim CARRIER to sync_token_watch for CONTINUOUS reserve-cliff watching.
+        # WHY (the FH $20k / CCC $117k miss, Aug 2026): analysis is ONE-SHOT at PairCreated -- a token seeded
+        # thin (dropped from `pending` after PENDING_TTL=6h), or in a MAX_CATCHUP-dropped range, or drained days
+        # after launch, is never re-examined. Appending it here lets the RPC watcher track its reserve forever
+        # and fire on the actual drain cliff. Append-only + exception-guarded: can NEVER disturb scan/commit.
+        if tok in _seeded: return
+        _seeded.add(tok)
+        try:
+            with open(os.path.join(HOME, "sync_watchlist_seed.jsonl"), "a") as f:
+                f.write(json.dumps({"token": tok, "pair": pair, "flag": flag, "t": int(time.time())}) + "\n")
+        except Exception:
+            pass
     def _fire(tok, pair, flag, usd):
         nonlocal fired
         # CALIBRATE the alert with a forge-accurate buy->sell round-trip sim (eth_call state-override). Fork-proven
@@ -430,6 +444,7 @@ def main():
         elif not flag:
             _mark(token)                                   # not burn-sync (bytecode immutable) -> never re-check
         else:
+            _seed_watch(token, pair, flag)                 # CONTINUOUS watch regardless of funding/TTL (FH/CCC fix)
             usd = base_liq_usd(pair, bnb)
             if usd >= MIN_LIQ_USD:
                 _fire(token, pair, flag, usd); _mark(token)
@@ -453,6 +468,7 @@ def main():
             if not flag:
                 del pending[token]; _mark(token); continue # resolved: not burn-sync
             pending[token][1] = flag                        # now known burn-sync -> fall through to liq check
+            _seed_watch(token, pair, flag)                   # and hand it to the continuous watcher (FH/CCC fix)
         usd = base_liq_usd(pair, bnb)
         if usd >= MIN_LIQ_USD:
             _fire(token, pair, flag, usd); del pending[token]; _mark(token)
