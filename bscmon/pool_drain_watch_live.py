@@ -235,6 +235,20 @@ def main():
     json.dump(sorted(ledger), open(LEDGER, "w"))
     print("done. real drains: %d | rejected FPs: %d | uncheckable(retry next run): %d | ledger %d"
           % (real, fp, unchk, len(ledger)))
+    # BLIND GUARD: candidates existed but the archive confirmed NONE (all uncheckable) -> the detector is BLIND,
+    # not quiet. A dead/credit-exhausted archive would otherwise exit 0 (green) while catching zero drains -- the
+    # exact silent failure that hid an exhausted Alchemy key. Make it LOUD: page once/day + non-zero exit (red run).
+    if cand and real == 0 and fp == 0 and unchk == len(cand):
+        warn = ("⚠️ <b>POOL-DRAIN DETECTOR BLIND</b>\n%d drain candidate(s) but the archive returned "
+                "UNCHECKABLE on ALL of them.\nARCHIVE_RPC_URL is down or out of monthly credits -> no drain can be "
+                "confirmed.\nFix the archive endpoint." % len(cand))
+        marker = LEDGER + ".blindwarn"; today = time.strftime("%Y-%m-%d")
+        last = open(marker).read().strip() if os.path.exists(marker) else ""
+        if last != today:
+            tg(warn); open(marker, "w").write(today)      # page at most once/day
+        else:
+            print(warn)                                    # already paged today -> just log
+        sys.exit(1)                                        # non-zero EVERY run so a blind detector stays visibly red
 
 if __name__ == "__main__":
     main()
