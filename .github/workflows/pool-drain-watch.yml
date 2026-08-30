@@ -47,7 +47,8 @@ jobs:
           git commit -m "ledger: update alerted drains [skip ci]" || echo "no ledger change"
           git push || echo "nothing to push"
 
-  # Weekly sanity gate: the detector MUST still surface MOKE, or the job fails loudly.
+  # Sanity gate (self-refreshing): SQL returns drains + confirm() confirms a real one live + gate rejects flow-through.
+  # (Was anchored on MOKE, which ages out of the 7d window -> perpetual false FAIL. Needs the archive URL too.)
   validate:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -55,7 +56,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - name: Self-test (MOKE must surface)
+      - name: Self-test (live pipeline must confirm a real drain)
         env:
-          DUNE_API_KEY: ${{ secrets.DUNE_API_KEY }}
+          DUNE_API_KEY:    ${{ secrets.DUNE_API_KEY }}
+          ARCHIVE_RPC_URL: https://bnb-mainnet.g.alchemy.com/v2/${{ secrets.ALCHEMY_KEY }}
         run: python bscmon/pool_drain_watch_live.py --validate
