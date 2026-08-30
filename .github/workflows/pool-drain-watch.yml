@@ -29,8 +29,10 @@ jobs:
       - name: Scan for pool drains
         env:
           DUNE_API_KEY:       ${{ secrets.DUNE_API_KEY }}
-          # reuse the existing ALCHEMY_KEY secret (same one pairwatch uses) -> full archive URL, no new secret needed
-          ARCHIVE_RPC_URL:    https://bnb-mainnet.g.alchemy.com/v2/${{ secrets.ALCHEMY_KEY }}
+          # DEDICATED archive endpoint (a full URL) -- kept SEPARATE from pairwatch's ALCHEMY_KEY, which is
+          # exhausted monthly by pairwatch's heavy use and would starve confirm(). Set this to a fresh Alchemy
+          # app's BSC URL (https://bnb-mainnet.g.alchemy.com/v2/<new-key>) or any working BSC archive node.
+          ARCHIVE_RPC_URL:    ${{ secrets.ARCHIVE_RPC_URL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           DRAIN_MIN_USD:      "15000"  # was 50000 -> that floor missed FH ($20k). $15k catches the FH/CCC/Fox class.
@@ -59,5 +61,5 @@ jobs:
       - name: Self-test (live pipeline must confirm a real drain)
         env:
           DUNE_API_KEY:    ${{ secrets.DUNE_API_KEY }}
-          ARCHIVE_RPC_URL: https://bnb-mainnet.g.alchemy.com/v2/${{ secrets.ALCHEMY_KEY }}
+          ARCHIVE_RPC_URL: ${{ secrets.ARCHIVE_RPC_URL }}
         run: python bscmon/pool_drain_watch_live.py --validate
