@@ -1,0 +1,59 @@
+name: bsc-pairwatch
+
+# COMPLETE-COVERAGE catch-up scanner — the free "full daemon on GitHub". Reads on-chain PairCreated events
+# (like the WS daemon) but POLLED every ~10 min instead of streamed. State (last-scanned block) persists via
+# actions/cache, so a delayed/skipped run just scans a bigger range next time — no permanent gap.
+# FREE ONLY ON A PUBLIC REPO (unlimited Actions minutes). On a private repo the 2000-min/mo cap kills it.
+on:
+  schedule:
+    - cron: '*/10 * * * *'      # every 10 min; catch-up design tolerates GitHub's cron lag
+  workflow_dispatch: {}          # manual run (sets SELFTEST -> sends a proof ping)
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bsc-pairwatch
+  cancel-in-progress: false      # never cancel a mid-scan run
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20      # matches PW_RUN_BUDGET_S=1020s (17 min scan+analysis) + ~3 min for state save/notify.
+                             # The run budget self-limits well under this; the timeout is only a hard backstop.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install eth-utils
+
+      - name: Restore scan state (last block + seen set)
+        uses: actions/cache/restore@v4
+        with:
+          path: pwstate
+          key: pairwatch-state-${{ github.run_id }}
+          restore-keys: pairwatch-state-
+
+      - name: Catch-up scan
+        env:
+          PW_HOME: ${{ github.workspace }}/pwstate
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ALCHEMY_KEY: ${{ secrets.ALCHEMY_KEY }}   # optional; falls back to public nodes if unset
+          ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}   # optional; enables the verified-source FP filter (kills legit sync-caller FPs)
+          MIN_LIQ_USD: '1000'
+          # manual "Run workflow" -> true -> sends a self-test ping proving the pipeline reaches your phone
+          SELFTEST: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          mkdir -p pwstate
+          python bscmon/bsc_pairwatch.py
+
+      - name: Save scan state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: pwstate
+          key: pairwatch-state-${{ github.run_id }}

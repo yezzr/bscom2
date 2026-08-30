@@ -1,0 +1,65 @@
+name: sync-token-watch
+
+# CONTINUOUS reserve-cliff monitor for the sync/skim-carrying token family (the FH $20k / CCC $117k
+# "burn-from-pair + sync" class). Fixes bsc-pairwatch's ONE-SHOT-at-creation blind spot: pairwatch
+# appends every confirmed sync/skim carrier to a seed file; THIS lane watches each one's pool reserve
+# every run and fires on the drain cliff, however many days after launch. Pure public RPC (no Dune,
+# no archive) -> also backstops pool-drain-watch when Dune is down or a drain syncs too few times.
+on:
+  schedule:
+    - cron: '*/15 * * * *'      # every 15 min
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-token-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # read the seed pairwatch produces (its state cache holds pwstate/sync_watchlist_seed.jsonl)
+      - name: Restore pairwatch seed cache (read-only)
+        uses: actions/cache/restore@v4
+        with:
+          path: pwstate
+          key: pairwatch-state-none            # force restore-keys fallback to the latest pairwatch cache
+          restore-keys: pairwatch-state-
+
+      # our own watchlist state (peak reserves per pool) persists across our runs
+      - name: Restore watchlist state
+        uses: actions/cache/restore@v4
+        with:
+          path: swstate
+          key: sync-watch-state-${{ github.run_id }}
+          restore-keys: sync-watch-state-
+
+      - name: Re-check watched pools for a drain cliff
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          SW_SEED:  ${{ github.workspace }}/pwstate/sync_watchlist_seed.jsonl
+          SW_STATE: ${{ github.workspace }}/swstate/sync_watchlist.json
+          SW_MIN_POOL_USD: '15000'
+          SW_FRACTION: '0.35'
+          # SW_LOG_RPC: <a getLogs-capable node> -> enables optional own-discovery; unset = seed-only (reliable)
+        run: |
+          mkdir -p swstate pwstate
+          python bscmon/sync_token_watch.py
+
+      - name: Save watchlist state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: swstate
+          key: sync-watch-state-${{ github.run_id }}

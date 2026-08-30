@@ -1,0 +1,61 @@
+name: pool-drain-watch
+
+# Effect-based BSC pool-drain tripwire (price-manip / flash-loan class).
+# Catches the class token-bytecode detectors are blind to: a pool that loses >=$MIN base
+# token in a multi-sync tx. One Dune SQL aggregation -> Telegram. Validated on MOKE ($1.52M).
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 min
+  workflow_dispatch: {}        # manual run button
+
+concurrency:                   # never overlap runs (ledger integrity)
+  group: pool-drain-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: write              # to commit the dedup ledger back
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Scan for pool drains
+        env:
+          DUNE_API_KEY:       ${{ secrets.DUNE_API_KEY }}
+          # reuse the existing ALCHEMY_KEY secret (same one pairwatch uses) -> full archive URL, no new secret needed
+          ARCHIVE_RPC_URL:    https://bnb-mainnet.g.alchemy.com/v2/${{ secrets.ALCHEMY_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          DRAIN_MIN_USD:      "15000"  # was 50000 -> that floor missed FH ($20k). $15k catches the FH/CCC/Fox class.
+          DRAIN_MIN_POOL_USD: "15000"  # was 50000 -> FH's pool was only ~$20-40k; a $50k pool-floor rejected it outright
+          DRAIN_MIN_FRACTION: "0.35"   # was 0.5 -> catch partial drains too; flash-swap flow-through still has frac~=0 -> rejected
+          DRAIN_LOOKBACK_HOURS: "2"    # window > cron interval, so nothing slips between runs
+        run: python bscmon/pool_drain_watch_live.py
+
+      - name: Persist dedup ledger
+        run: |
+          git config user.name  "pool-drain-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add -A pool_drain_ledger.json bscmon/pool_drain_ledger.json 2>/dev/null || true
+          git commit -m "ledger: update alerted drains [skip ci]" || echo "no ledger change"
+          git push || echo "nothing to push"
+
+  # Weekly sanity gate: the detector MUST still surface MOKE, or the job fails loudly.
+  validate:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Self-test (MOKE must surface)
+        env:
+          DUNE_API_KEY: ${{ secrets.DUNE_API_KEY }}
+        run: python bscmon/pool_drain_watch_live.py --validate
