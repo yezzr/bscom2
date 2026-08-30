@@ -29,6 +29,7 @@ jobs:
       - name: Scan for pool drains
         env:
           DUNE_API_KEY:       ${{ secrets.DUNE_API_KEY }}
+          DUNE_QUERY_ID:      ${{ secrets.DUNE_QUERY_ID }}   # a query YOUR Dune key owns (else PATCH fails -> stale SQL)
           # DEDICATED archive endpoint (a full URL) -- kept SEPARATE from pairwatch's ALCHEMY_KEY, which is
           # exhausted monthly by pairwatch's heavy use and would starve confirm(). Set this to a fresh Alchemy
           # app's BSC URL (https://bnb-mainnet.g.alchemy.com/v2/<new-key>) or any working BSC archive node.
@@ -61,5 +62,6 @@ jobs:
       - name: Self-test (live pipeline must confirm a real drain)
         env:
           DUNE_API_KEY:    ${{ secrets.DUNE_API_KEY }}
+          DUNE_QUERY_ID:   ${{ secrets.DUNE_QUERY_ID }}
           ARCHIVE_RPC_URL: ${{ secrets.ARCHIVE_RPC_URL }}
         run: python bscmon/pool_drain_watch_live.py --validate
